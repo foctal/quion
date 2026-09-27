@@ -90,6 +90,7 @@ impl Writer {
         }
     }
 
+    #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
     pub(crate) fn from_vec(output: Vec<u8>) -> Self {
         Self { output }
     }
