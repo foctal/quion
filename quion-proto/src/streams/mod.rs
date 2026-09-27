@@ -101,7 +101,7 @@ impl SendFlowController {
         self.consumed = 0;
     }
 
-    fn consume(&mut self, amount: u64) -> bool {
+    pub(crate) fn consume(&mut self, amount: u64) -> bool {
         if amount > self.available() {
             return false;
         }
@@ -236,10 +236,13 @@ impl SendBuffer {
         max_frame_data: usize,
         mut bytes: Vec<u8>,
     ) -> Option<Chunk> {
-        let available = stream_flow.available();
-        let available = connection_flow
-            .as_ref()
-            .map_or(available, |flow| available.min(flow.available()));
+        // RESET_STREAM_AT may already have charged its final size. Its reliable
+        // prefix still needs transmission, without consuming that credit twice.
+        let prepaid = stream_flow.consumed().saturating_sub(self.next_offset);
+        let available = stream_flow.max_data().saturating_sub(self.next_offset);
+        let available = connection_flow.as_ref().map_or(available, |flow| {
+            available.min(flow.available().saturating_add(prepaid))
+        });
         let max_frame_data = max_frame_data.min(usize::try_from(available).ok()?);
         if max_frame_data == 0 {
             return self.poll_fin_only(stream_flow);
@@ -275,9 +278,10 @@ impl SendBuffer {
         };
         self.queued_len -= take;
         self.next_offset += frame_bytes.len() as u64;
-        stream_flow.consume(frame_bytes.len() as u64);
+        let newly_sent = self.next_offset.saturating_sub(stream_flow.consumed());
+        stream_flow.consume(newly_sent);
         if let Some(flow) = connection_flow.as_mut() {
-            flow.consume(frame_bytes.len() as u64);
+            flow.consume(newly_sent);
         }
         let fin = self.final_offset == Some(self.next_offset) && self.queued_len == 0;
         self.fin_sent |= fin;
@@ -1017,7 +1021,10 @@ impl RecvStreamState {
         now: Instant,
         smoothed_rtt: Duration,
     ) -> Option<(Chunk, Option<u64>)> {
-        let chunk = self.assembler.read_ordered(&mut self.read_offset, max)?;
+        let mut chunk = self.assembler.read_ordered(&mut self.read_offset, max)?;
+        // A reliable reset supplies a final size without promising graceful FIN.
+        // Deliver its prefix first, then leave the reset observable to callers.
+        chunk.fin &= self.reliable_reset.is_none();
         self.delivered = self.delivered.saturating_add(chunk.bytes.len() as u64);
         let new_limit = (!chunk.bytes.is_empty())
             .then(|| {
@@ -1038,14 +1045,15 @@ impl RecvStreamState {
         now: Instant,
         smoothed_rtt: Duration,
     ) -> Option<(Chunk, Option<u64>)> {
-        let chunk = if self
-            .reliable_reset
-            .is_some_and(|(_, reliable_size)| self.read_offset < reliable_size)
-        {
-            self.assembler.read_ordered(&mut self.read_offset, max)?
-        } else {
-            self.assembler.read_unordered(max)?
-        };
+        let mut chunk = self.assembler.read_unordered(max)?;
+        self.read_offset = self
+            .assembler
+            .delivered
+            .iter()
+            .next()
+            .filter(|(start, _)| *start == 0)
+            .map_or(0, |(_, end)| end);
+        chunk.fin &= self.reliable_reset.is_none();
         self.delivered = self.delivered.saturating_add(chunk.bytes.len() as u64);
         let new_limit = (!chunk.bytes.is_empty())
             .then(|| {
@@ -1064,8 +1072,11 @@ impl RecvStreamState {
     pub fn reset(&mut self, final_size: u64, error_code: VarInt) -> Result<u64> {
         let received_before = self.flow.received();
         if self
-            .reliable_reset
-            .is_some_and(|(existing_error, _)| existing_error != error_code)
+            .reset_error
+            .is_some_and(|existing| existing != error_code)
+            || self
+                .reliable_reset
+                .is_some_and(|(existing, _)| existing != error_code)
         {
             return Err(CodecError::Transport(TransportErrorCode::StreamStateError));
         }
@@ -1099,6 +1110,15 @@ impl RecvStreamState {
                 TransportErrorCode::FrameEncodingError,
             ));
         }
+        if self
+            .reset_error
+            .is_some_and(|existing| existing != error_code)
+            || self
+                .reliable_reset
+                .is_some_and(|(existing, _)| existing != error_code)
+        {
+            return Err(CodecError::Transport(TransportErrorCode::StreamStateError));
+        }
         let received_before = self.flow.received();
         if final_size > self.flow.max_data() {
             return Err(CodecError::Transport(TransportErrorCode::FlowControlError));
@@ -1108,10 +1128,10 @@ impl RecvStreamState {
         }
         self.assembler.set_final_offset(final_size)?;
         self.flow.validate_frame(final_size, 0)?;
+        if self.stopped {
+            return Ok(self.flow.received().saturating_sub(received_before));
+        }
         match self.reliable_reset {
-            Some((existing_error, _)) if existing_error != error_code => {
-                return Err(CodecError::Transport(TransportErrorCode::StreamStateError));
-            }
             Some((_, existing_reliable)) if reliable_size >= existing_reliable => {}
             _ => self.reliable_reset = Some((error_code, reliable_size)),
         }
@@ -1449,7 +1469,10 @@ impl StreamMap {
         let (mut result, terminal) = {
             let stream = self.recv.get_mut(&stream_id)?;
             let result = stream.read_ordered_with_flow_update_at(max, now, smoothed_rtt)?;
-            let terminal = stream.final_offset() == Some(stream.delivered());
+            // Keep a reliable reset's reason until stop/drop, just as for an
+            // ordinary reset. Consuming its final byte must not erase the error.
+            let terminal = stream.final_offset() == Some(stream.delivered())
+                && stream.reliable_size().is_none();
             (result, terminal)
         };
         self.recv_buffered_stream_data = self
@@ -1486,7 +1509,10 @@ impl StreamMap {
         let (mut result, terminal) = {
             let stream = self.recv.get_mut(&stream_id)?;
             let result = stream.read_unordered_with_flow_update_at(max, now, smoothed_rtt)?;
-            let terminal = stream.final_offset() == Some(stream.delivered());
+            // Keep a reliable reset's reason until stop/drop, just as for an
+            // ordinary reset. Consuming its final byte must not erase the error.
+            let terminal = stream.final_offset() == Some(stream.delivered())
+                && stream.reliable_size().is_none();
             (result, terminal)
         };
         self.recv_buffered_stream_data = self
@@ -1747,6 +1773,107 @@ impl Default for StreamMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reliable_reset_after_unordered_delivery_does_not_wait_for_consumed_bytes() {
+        let mut stream = RecvStreamState::new(20);
+        stream
+            .insert_frame(3, Bytes::from_static(b"der"), false)
+            .unwrap();
+        assert_eq!(
+            stream.read_unordered_with_flow_update(3).unwrap().0.offset,
+            3
+        );
+        stream.reset_at(10, 6, VarInt::from_u32(42)).unwrap();
+        assert_eq!(stream.reset_error(), None);
+        stream
+            .insert_frame(0, Bytes::from_static(b"hea"), false)
+            .unwrap();
+        let chunk = stream.read_unordered_with_flow_update(3).unwrap().0;
+        assert_eq!(&chunk.bytes[..], b"hea");
+        assert!(!chunk.fin);
+        assert_eq!(stream.reset_error(), Some(VarInt::from_u32(42)));
+        assert_eq!(stream.take_connection_release(), 10);
+    }
+
+    #[test]
+    fn reordered_reliable_reset_cannot_resurrect_an_ordinary_reset() {
+        for reliable_first in [true, false] {
+            let mut stream = RecvStreamState::new(20);
+            if reliable_first {
+                stream.reset_at(10, 6, VarInt::from_u32(42)).unwrap();
+            }
+            stream.reset(10, VarInt::from_u32(42)).unwrap();
+            stream.reset_at(10, 6, VarInt::from_u32(42)).unwrap();
+            assert_eq!(stream.reset_error(), Some(VarInt::from_u32(42)));
+            assert_eq!(stream.reliable_size(), None);
+            assert_eq!(stream.take_connection_release(), 10);
+            assert!(stream.reset_at(10, 6, VarInt::from_u32(99)).is_err());
+            assert!(stream.reset(10, VarInt::from_u32(99)).is_err());
+            assert_eq!(stream.reset_error(), Some(VarInt::from_u32(42)));
+        }
+    }
+
+    #[test]
+    fn reliable_reset_at_final_size_preserves_error_until_stop() {
+        for ordered in [true, false] {
+            for reset_first in [true, false] {
+                for final_size in [0, 6, 10] {
+                    let mut streams = StreamMap::new(32);
+                    let id = StreamId(VarInt::from_u32(3));
+                    let prefix = b"header";
+                    let reliable_size = final_size.min(prefix.len() as u64);
+                    if reset_first {
+                        streams
+                            .reset_stream_at(id, final_size, reliable_size, VarInt::from_u32(42))
+                            .unwrap();
+                    }
+                    if reliable_size != 0 {
+                        // Deliver out of order and consume the reliable prefix in
+                        // fragments, including through the unordered API.
+                        streams
+                            .receive_stream_frame(id, 3, Bytes::from_static(b"der"), false)
+                            .unwrap();
+                        streams
+                            .receive_stream_frame(id, 0, Bytes::from_static(b"hea"), false)
+                            .unwrap();
+                    }
+                    if !reset_first {
+                        streams
+                            .reset_stream_at(id, final_size, reliable_size, VarInt::from_u32(42))
+                            .unwrap();
+                    }
+                    assert_eq!(streams.accept_recv_stream(), Some(id));
+                    let mut received = Vec::new();
+                    while received.len() < reliable_size as usize {
+                        assert_eq!(streams.recv_stream(id).unwrap().reset_error(), None);
+                        let chunk = if ordered {
+                            streams.read_ordered(id, 2).unwrap()
+                        } else {
+                            streams.read_unordered_with_flow_update(id, 2).unwrap().0
+                        };
+                        assert!(
+                            !chunk.fin,
+                            "a reliable reset must not report a graceful FIN"
+                        );
+                        received.extend_from_slice(&chunk.bytes);
+                    }
+                    assert_eq!(received, &prefix[..reliable_size as usize]);
+                    assert_eq!(
+                        streams.recv_stream(id).unwrap().reset_error(),
+                        Some(VarInt::from_u32(42))
+                    );
+                    assert!(!streams.is_recv_stream_closed(id));
+                    assert_eq!(streams.recv_buffered_stream_data, 0);
+                    assert_eq!(streams.take_connection_release(), final_size);
+                    streams.stop_recv_stream(id).unwrap();
+                    assert!(streams.is_recv_stream_closed(id));
+                    assert_eq!(streams.recv_stream_count(), 0);
+                    assert_eq!(streams.take_connection_release(), 0);
+                }
+            }
+        }
+    }
 
     #[test]
     fn send_buffer_respects_flow_control_and_fin() {

@@ -410,3 +410,179 @@ async fn keep_alive_preserves_an_idle_udp_connection() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loopback_header_only_reliable_reset_reports_error_across_read_apis() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut transport = TransportConfig::default();
+        transport.set_reset_stream_at(true);
+        let (client_endpoint, server_endpoint, driver, client, server) =
+            connect_loopback(transport.clone(), transport).await;
+        for bidirectional in [false, true] {
+            for mode in 0..5 {
+                let mut send = if bidirectional {
+                    let (send, _recv) = client.open_bi().await.unwrap();
+                    send
+                } else {
+                    client.open_uni().await.unwrap()
+                };
+                send.write_all(b"header").await.unwrap();
+                send.reset_at(VarInt::from_u32(42), VarInt::from_u32(6)).unwrap();
+                let mut recv = if bidirectional {
+                    let (_send, recv) = server.accept_bi().await.unwrap();
+                    recv
+                } else {
+                    server.accept_uni().await.unwrap()
+                };
+                match mode {
+                    0 => {
+                        let mut prefix = [0; 6];
+                        recv.read_exact(&mut prefix).await.unwrap();
+                        assert_eq!(&prefix, b"header");
+                        assert_eq!(recv.received_reset().await.unwrap(), Some(VarInt::from_u32(42)));
+                        assert_eq!(recv.read(&mut [0; 1]).await, Err(quion::ReadError::Reset(VarInt::from_u32(42))));
+                    }
+                    1 | 2 => {
+                        let mut prefix = Vec::new();
+                        while prefix.len() < 6 {
+                            let chunk = recv.read_chunk(2, mode == 1).await.unwrap().unwrap();
+                            assert!(!chunk.fin);
+                            prefix.extend_from_slice(&chunk.bytes);
+                        }
+                        assert_eq!(prefix, b"header");
+                        assert!(matches!(recv.read_chunk(1, mode == 1).await, Err(quion::ReadError::Reset(code)) if code == VarInt::from_u32(42)));
+                    }
+                    3 => assert_eq!(recv.read_to_end(6).await, Err(quion::ReadError::Reset(VarInt::from_u32(42)))),
+                    4 => {
+                        let error = tokio::io::AsyncReadExt::read_to_end(&mut recv, &mut Vec::new()).await.unwrap_err();
+                        assert_eq!(error.get_ref().unwrap().downcast_ref::<quion::ReadError>(), Some(&quion::ReadError::Reset(VarInt::from_u32(42))));
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        client_endpoint.abort();
+        server_endpoint.abort();
+        driver.stop().await.unwrap();
+    }).await.expect("reliable reset regression timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loopback_webtransport_exporter_and_final_sizes() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut transport = TransportConfig::default();
+        transport.set_reset_stream_at(true);
+        let (client_endpoint, server_endpoint, driver, client, server) =
+            connect_loopback(transport.clone(), transport).await;
+        let mut client_key = [0; 32];
+        let mut server_key = [0; 32];
+        // Session ID, application label length and bytes, context length.
+        let context = b"\0\0\0\0\0\0\0\0\x03app\0";
+        client
+            .export_keying_material(&mut client_key, b"EXPORTER-WebTransport", context)
+            .unwrap();
+        server
+            .export_keying_material(&mut server_key, b"EXPORTER-WebTransport", context)
+            .unwrap();
+        assert_eq!(client_key, server_key);
+        assert_ne!(client_key, [0; 32]);
+        let mut other = [0; 32];
+        server
+            .export_keying_material(
+                &mut other,
+                b"EXPORTER-WebTransport",
+                b"\0\0\0\0\0\0\0\x04\x03app\0",
+            )
+            .unwrap();
+        assert_ne!(client_key, other);
+        server
+            .export_keying_material(&mut other, b"EXPORTER-other", context)
+            .unwrap();
+        assert_ne!(client_key, other);
+
+        let mut empty = client.open_uni().await.unwrap();
+        empty.reset_at(VarInt::from_u32(42), VarInt::ZERO).unwrap();
+        let mut recv = server.accept_uni().await.unwrap();
+        assert_eq!(recv.received_final_size().await.unwrap(), 0);
+        assert_eq!(
+            recv.received_reset().await.unwrap(),
+            Some(VarInt::from_u32(42))
+        );
+        assert_eq!(empty.stopped().await.unwrap(), None);
+
+        for mode in 0..4 {
+            let mut send = client.open_uni().await.unwrap();
+            send.write_all(b"header").await.unwrap();
+            let mut recv = server.accept_uni().await.unwrap();
+            let mut header = [0; 6];
+            recv.read_exact(&mut header).await.unwrap();
+            assert_eq!(recv.final_size(), None);
+            match mode {
+                0 => send.finish().unwrap(),
+                1 => send.reset(VarInt::from_u32(42)).unwrap(),
+                2 => send
+                    .reset_at(VarInt::from_u32(42), VarInt::from_u32(6))
+                    .unwrap(),
+                3 => {
+                    // The final size includes the discarded application bytes.
+                    send.write_all(b"discarded").await.unwrap();
+                    send.reset_at(VarInt::from_u32(42), VarInt::from_u32(6))
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                recv.received_reset().await.unwrap(),
+                if mode == 0 {
+                    None
+                } else {
+                    Some(VarInt::from_u32(42))
+                }
+            );
+            let size = if mode == 3 { 15 } else { 6 };
+            assert_eq!(recv.final_size(), Some(size));
+            recv.stop(VarInt::ZERO).unwrap();
+            assert_eq!(recv.final_size(), Some(size));
+            if mode >= 2 {
+                assert_eq!(send.stopped().await.unwrap(), None);
+            }
+        }
+        client_endpoint.abort();
+        server_endpoint.abort();
+        driver.stop().await.unwrap();
+    })
+    .await
+    .expect("WebTransport transport APIs timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loopback_final_size_survives_read_completion_and_local_stop() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let (client_endpoint, server_endpoint, driver, client, server) =
+            connect_loopback(TransportConfig::default(), TransportConfig::default()).await;
+        let mut send = client.open_uni().await.unwrap();
+        send.write_all(b"complete").await.unwrap();
+        send.finish().unwrap();
+        let mut recv = server.accept_uni().await.unwrap();
+        assert_eq!(recv.read_to_end(8).await.unwrap(), b"complete");
+        assert_eq!(recv.final_size(), Some(8));
+        assert_eq!(recv.received_final_size().await.unwrap(), 8);
+        recv.stop(VarInt::ZERO).unwrap();
+        assert_eq!(recv.final_size(), Some(8));
+
+        let mut send = client.open_uni().await.unwrap();
+        send.write_all(b"cancel").await.unwrap();
+        let mut recv = server.accept_uni().await.unwrap();
+        recv.read_exact(&mut [0; 6]).await.unwrap();
+        assert_eq!(recv.final_size(), None);
+        recv.stop(VarInt::from_u32(9)).unwrap();
+        assert_eq!(recv.received_final_size().await.unwrap(), 6);
+        assert_eq!(send.stopped().await.unwrap(), Some(VarInt::from_u32(9)));
+        assert_eq!(recv.final_size(), Some(6));
+        client_endpoint.abort();
+        server_endpoint.abort();
+        driver.stop().await.unwrap();
+    })
+    .await
+    .expect("final size observation timed out");
+}

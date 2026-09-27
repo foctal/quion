@@ -5965,7 +5965,7 @@ fn install_peer_transport_parameters(
     let Some(bytes) = session.peer_transport_parameters() else {
         return Ok(false);
     };
-    let params = quion_proto::transport_parameters::TransportParameters::decode(bytes)
+    let params = quion_proto::transport_parameters::TransportParameters::decode(&bytes)
         .map_err(|error| ConnectionError::TransportError(error.transport_code()))?;
     params
         .validate_quic_basics()
@@ -5980,6 +5980,7 @@ fn apply_session_security_context(
     session: &quion_proto::crypto::rustls::RustlsSession,
 ) {
     connection.set_peer_security_context(session.peer_certificates(), session.alpn_protocol());
+    connection.set_tls_exporter(session.exporter());
 }
 
 #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]

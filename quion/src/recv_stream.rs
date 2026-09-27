@@ -139,6 +139,36 @@ impl RecvStream {
         self.stream_id
     }
 
+    /// Returns the stream's final size once FIN or a reset has been received.
+    ///
+    /// Includes bytes discarded by a reset and any application protocol prefix.
+    /// The value is retained for this handle after reads or `stop`, allowing
+    /// applications to account for discarded bytes. `None` means the
+    /// peer has not supplied a final size yet. This does not consume data or
+    /// imply that the reliable prefix has been delivered.
+    pub fn final_size(&self) -> Option<u64> {
+        let (Some(proto), Some(id), Some(state)) =
+            (&self.proto, self.stream_id, &self.stream_reset_state)
+        else {
+            return None;
+        };
+        let proto = proto.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(size) = proto.recv_stream_final_size(id) {
+            state.set_final_size(id, size);
+        }
+        state.final_size(id)
+    }
+
+    /// Waits until the peer supplies the final size, without consuming data.
+    ///
+    /// This also works after `stop`, when an application needs to account for bytes
+    /// discarded by cancellation. Returns a connection error if the connection
+    /// closes before the peer supplies the size.
+    pub fn received_final_size(&mut self) -> impl Future<Output = Result<u64, ReadError>> + '_ {
+        ReceivedFinalSize { stream: self }
+    }
+
     /// Reads exactly enough bytes to fill `buf`.
     pub fn read_exact<'a>(
         &'a mut self,
@@ -189,6 +219,7 @@ impl RecvStream {
     /// Requests that the peer stop sending this stream.
     pub fn stop(&mut self, error_code: VarInt) -> Result<(), ReadError> {
         self.check_closed()?;
+        let _ = self.final_size();
         if let (Some(proto), Some(stream_id)) = (&self.proto, self.stream_id) {
             let mut proto = proto
                 .lock()
@@ -272,6 +303,12 @@ impl RecvStream {
             let mut proto = proto
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(size) = proto.recv_stream_final_size(stream_id) {
+                stream_reset_state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .set_final_size(stream_id, size);
+            }
             let mut chunks = SmallVec::<[Chunk; 8]>::new();
             let mut remaining = max_size;
             while chunks.len() < max_chunks {
@@ -436,6 +473,44 @@ fn map_read_error(error: quion_proto::CodecError) -> ReadError {
 struct Read<'a> {
     stream: &'a mut RecvStream,
     buf: &'a mut [u8],
+}
+
+struct ReceivedFinalSize<'a> {
+    stream: &'a mut RecvStream,
+}
+
+impl Future for ReceivedFinalSize<'_> {
+    type Output = Result<u64, ReadError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let stream = &mut self.get_mut().stream;
+        let (Some(proto), Some(id), Some(state), Some(wakers)) = (
+            &stream.proto,
+            stream.stream_id,
+            &stream.stream_reset_state,
+            &stream.stream_wakers,
+        ) else {
+            return Poll::Ready(Err(ReadError::FinishedEarly));
+        };
+        // Register under the protocol lock, following the same lock order as reads.
+        let proto = proto.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(size) = proto.recv_stream_final_size(id) {
+            state.set_final_size(id, size);
+        }
+        if let Some(size) = state.final_size(id) {
+            return Poll::Ready(Ok(size));
+        }
+        if let Err(error) = stream.check_closed() {
+            return Poll::Ready(Err(error));
+        }
+        wakers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .register_reader(id, cx.waker());
+        state.register_waiter(id, cx.waker());
+        Poll::Pending
+    }
 }
 
 struct ReceivedReset<'a> {

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use rustls::{
     pki_types::ServerName,
@@ -31,7 +31,7 @@ impl RustlsProvider {
             transport_parameters,
         )
         .map_err(map_rustls_error)?;
-        Ok(RustlsSession::Client(conn))
+        Ok(RustlsSession::new(quic::Connection::Client(conn)))
     }
 
     pub fn start_server_with_transport_parameters(
@@ -41,7 +41,7 @@ impl RustlsProvider {
     ) -> Result<RustlsSession> {
         let conn = quic::ServerConnection::new(config, quic::Version::V1, transport_parameters)
             .map_err(map_rustls_error)?;
-        Ok(RustlsSession::Server(conn))
+        Ok(RustlsSession::new(quic::Connection::Server(conn)))
     }
 }
 
@@ -65,20 +65,60 @@ impl CryptoProvider for RustlsProvider {
     }
 }
 
+/// A TLS session whose exporter can be shared with an established connection.
 #[derive(Debug)]
-pub enum RustlsSession {
-    Client(quic::ClientConnection),
-    Server(quic::ServerConnection),
+pub struct RustlsSession {
+    connection: Arc<Mutex<quic::Connection>>,
+}
+
+/// Access to the TLS exporter without exposing mutable handshake state.
+#[derive(Debug, Clone)]
+pub struct RustlsExporter {
+    connection: Arc<Mutex<quic::Connection>>,
+}
+
+impl RustlsExporter {
+    /// Derives TLS 1.3 keying material after handshake completion.
+    pub fn export_keying_material(
+        &self,
+        output: &mut [u8],
+        label: &[u8],
+        context: &[u8],
+    ) -> Result<()> {
+        self.connection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .export_keying_material(output, label, Some(context))
+            .map(|_| ())
+            .map_err(map_rustls_error)
+    }
 }
 
 impl RustlsSession {
+    fn new(connection: quic::Connection) -> Self {
+        Self {
+            connection: Arc::new(Mutex::new(connection)),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, quic::Connection> {
+        self.connection.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Returns a handle to this session's TLS exporter.
+    pub fn exporter(&self) -> RustlsExporter {
+        RustlsExporter {
+            connection: self.connection.clone(),
+        }
+    }
+
     #[cfg(feature = "zero-rtt")]
     pub fn install_zero_rtt_keys(&self, keys: &mut RustlsKeyStore) -> bool {
-        match self {
-            Self::Client(conn) => conn
+        match &*self.lock() {
+            quic::Connection::Client(conn) => conn
                 .zero_rtt_keys()
                 .map(|zero_rtt| keys.install_zero_rtt_local(zero_rtt)),
-            Self::Server(conn) => conn
+            quic::Connection::Server(conn) => conn
                 .zero_rtt_keys()
                 .map(|zero_rtt| keys.install_zero_rtt_remote(zero_rtt)),
         }
@@ -87,60 +127,45 @@ impl RustlsSession {
 
     /// Returns the server's resolved 0-RTT decision for a client session.
     ///
-    /// `None` means this is a server session or the handshake is still in
-    /// progress.
+    /// `None` means this is a server session or the handshake is still in progress.
     #[cfg(feature = "zero-rtt")]
     pub fn client_zero_rtt_accepted(&self) -> Option<bool> {
-        match self {
-            Self::Client(conn) if !conn.is_handshaking() => Some(conn.is_early_data_accepted()),
-            Self::Client(_) | Self::Server(_) => None,
+        match &*self.lock() {
+            quic::Connection::Client(conn) if !conn.is_handshaking() => {
+                Some(conn.is_early_data_accepted())
+            }
+            _ => None,
         }
     }
 
     pub fn read_handshake(&mut self, plaintext: &[u8]) -> Result<()> {
-        match self {
-            Self::Client(conn) => conn.read_hs(plaintext).map_err(map_rustls_error),
-            Self::Server(conn) => conn.read_hs(plaintext).map_err(map_rustls_error),
-        }
+        self.lock().read_hs(plaintext).map_err(map_rustls_error)
     }
 
     pub fn write_handshake(&mut self, out: &mut Vec<u8>) -> Option<RustlsKeyChange> {
-        match self {
-            Self::Client(conn) => conn.write_hs(out).map(RustlsKeyChange::from),
-            Self::Server(conn) => conn.write_hs(out).map(RustlsKeyChange::from),
-        }
+        self.lock().write_hs(out).map(RustlsKeyChange::from)
     }
 
-    pub fn peer_transport_parameters(&self) -> Option<&[u8]> {
-        match self {
-            Self::Client(conn) => conn.quic_transport_parameters(),
-            Self::Server(conn) => conn.quic_transport_parameters(),
-        }
+    /// Returns an owned copy of the peer's encoded QUIC transport parameters,
+    /// or `None` if they have not been received yet.
+    pub fn peer_transport_parameters(&self) -> Option<Vec<u8>> {
+        self.lock()
+            .quic_transport_parameters()
+            .map(ToOwned::to_owned)
     }
 
     pub fn alert(&self) -> Option<rustls::AlertDescription> {
-        match self {
-            Self::Client(conn) => conn.alert(),
-            Self::Server(conn) => conn.alert(),
-        }
+        self.lock().alert()
     }
 
     pub fn peer_certificates(&self) -> Option<Vec<Vec<u8>>> {
-        match self {
-            Self::Client(conn) => conn
-                .peer_certificates()
-                .map(|certs| certs.iter().map(|cert| cert.as_ref().to_vec()).collect()),
-            Self::Server(conn) => conn
-                .peer_certificates()
-                .map(|certs| certs.iter().map(|cert| cert.as_ref().to_vec()).collect()),
-        }
+        self.lock()
+            .peer_certificates()
+            .map(|certs| certs.iter().map(|cert| cert.as_ref().to_vec()).collect())
     }
 
     pub fn alpn_protocol(&self) -> Option<Vec<u8>> {
-        match self {
-            Self::Client(conn) => conn.alpn_protocol().map(ToOwned::to_owned),
-            Self::Server(conn) => conn.alpn_protocol().map(ToOwned::to_owned),
-        }
+        self.lock().alpn_protocol().map(ToOwned::to_owned)
     }
 }
 
@@ -155,10 +180,7 @@ impl CryptoSession for RustlsSession {
     }
 
     fn is_handshaking(&self) -> bool {
-        match self {
-            Self::Client(conn) => conn.is_handshaking(),
-            Self::Server(conn) => conn.is_handshaking(),
-        }
+        self.lock().is_handshaking()
     }
 }
 
@@ -1001,11 +1023,11 @@ pub(crate) mod tests {
         assert!(!client_tls.is_handshaking());
         assert!(!server_tls.is_handshaking());
         assert_eq!(
-            client_tls.peer_transport_parameters(),
+            client_tls.peer_transport_parameters().as_deref(),
             Some(&b"server transport parameters"[..])
         );
         assert_eq!(
-            server_tls.peer_transport_parameters(),
+            server_tls.peer_transport_parameters().as_deref(),
             Some(&b"client transport parameters"[..])
         );
         assert!(client_keys.has_handshake());
@@ -1527,9 +1549,9 @@ pub(crate) mod tests {
             );
             io.deliver_to_client(&mut client_conn, &mut client_tls);
 
-            let ticket_ready = match &client_tls {
-                RustlsSession::Client(conn) => conn.tls13_tickets_received() > 0,
-                RustlsSession::Server(_) => false,
+            let ticket_ready = match &*client_tls.lock() {
+                quic::Connection::Client(conn) => conn.tls13_tickets_received() > 0,
+                quic::Connection::Server(_) => false,
             };
             if !client_tls.is_handshaking()
                 && !server_tls.is_handshaking()
@@ -1732,8 +1754,8 @@ pub(crate) mod tests {
         let (first_client, _, _, _, _) =
             simulated_handshake_with_configs(client.clone(), server.clone(), true);
         assert!(matches!(
-            first_client,
-            RustlsSession::Client(ref conn) if conn.tls13_tickets_received() > 0
+            &*first_client.lock(),
+            quic::Connection::Client(conn) if conn.tls13_tickets_received() > 0
         ));
         (client, server)
     }

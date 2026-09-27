@@ -102,6 +102,15 @@ extension with `TransportConfig::set_reset_stream_at(true)` and verify
 `NegotiatedTransport::reset_stream_at` after the handshake. See
 [`webtransport.md`](webtransport.md) for its WebTransport use.
 
+`RecvStream::final_size()` reports the peer's final byte offset once known,
+including data discarded by a reset. `received_final_size().await` waits for
+that value without consuming the stream. The size remains available after
+reading EOF or calling `stop`, until the receive handle is dropped.
+
+With a rustls provider enabled, `Connection::export_keying_material` derives
+TLS 1.3 keying material after the handshake. Adapters that multiplex sessions
+must use their protocol's session-specific exporter label and context.
+
 ## Datagrams
 
 When DATAGRAM support is negotiated, applications can call:

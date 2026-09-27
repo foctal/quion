@@ -68,7 +68,8 @@ pub use endpoint::EndpointServerUdpDriverHandle;
 pub use endpoint::ZeroRttAccepted;
 pub use endpoint::{Accept, Connecting, Endpoint};
 pub use error::{
-    ConfigError, ConnectionError, EndpointError, ReadError, Result, SendDatagramError, WriteError,
+    ConfigError, ConnectionError, EndpointError, ExportKeyingMaterialError, ReadError, Result,
+    SendDatagramError, WriteError,
 };
 pub use incoming::Incoming;
 pub use qlog::{QlogEvent, QlogHandler};

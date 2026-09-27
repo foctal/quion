@@ -179,3 +179,8 @@ pub enum ReadError {
     #[error("connection lost: {0}")]
     ConnectionLost(ConnectionError),
 }
+
+/// TLS keying material was unavailable or the requested output was too long.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("TLS keying material export failed")]
+pub struct ExportKeyingMaterialError;
