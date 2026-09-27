@@ -412,7 +412,13 @@ async fn sustained_connection_stream_and_datagram_churn() {
         }
     })
     .await
-    .expect("endpoint memory reservations were not released after abort");
+    .unwrap_or_else(|_| {
+        panic!(
+            "endpoint memory reservations were not released after abort: client={:?}, server={:?}",
+            client_endpoint.diagnostics(),
+            server_endpoint.diagnostics(),
+        )
+    });
 
     let client_diagnostics = client_endpoint.diagnostics();
     let server_diagnostics = server_endpoint.diagnostics();
@@ -599,7 +605,13 @@ async fn handshake_and_stream_recovery_survive_deterministic_network_impairment(
         }
     })
     .await
-    .expect("endpoint memory reservations were not released after abort");
+    .unwrap_or_else(|_| {
+        panic!(
+            "endpoint memory reservations were not released after abort: client={:?}, server={:?}",
+            client_endpoint.diagnostics(),
+            server_endpoint.diagnostics(),
+        )
+    });
     assert_eq!(
         client_endpoint.diagnostics().memory.reserved_payload_bytes,
         0
