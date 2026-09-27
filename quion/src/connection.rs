@@ -111,6 +111,8 @@ pub struct ConnectionInner {
     retired_local_connection_id_pending: AtomicBool,
     peer_certificates: Mutex<Option<Vec<Vec<u8>>>>,
     alpn_protocol: Mutex<Option<Vec<u8>>>,
+    #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
+    tls_exporter: Mutex<Option<quion_proto::crypto::rustls::RustlsExporter>>,
     negotiated_transport: Arc<Mutex<Option<NegotiatedTransport>>>,
     established: Mutex<bool>,
     #[cfg(feature = "zero-rtt")]
@@ -511,6 +513,8 @@ impl Connection {
                 retired_local_connection_id_pending: AtomicBool::new(false),
                 peer_certificates: Mutex::new(None),
                 alpn_protocol: Mutex::new(None),
+                #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
+                tls_exporter: Mutex::new(None),
                 negotiated_transport: Arc::new(Mutex::new(None)),
                 established: Mutex::new(false),
                 #[cfg(feature = "zero-rtt")]
@@ -1284,6 +1288,36 @@ impl Connection {
             counters.packets_sent = counters.packets_sent.saturating_add(packets);
             counters.bytes_sent = counters.bytes_sent.saturating_add(bytes as u64);
         }
+    }
+
+    /// Derives TLS 1.3 keying material using the supplied label and context.
+    ///
+    /// Available after the handshake completes. This never uses the early
+    /// exporter. Use the label and context encoding defined by the application
+    /// protocol. Protocols that multiplex sessions should include session
+    /// identifiers in the context to separate their keying material.
+    #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
+    pub fn export_keying_material(
+        &self,
+        output: &mut [u8],
+        label: &[u8],
+        context: &[u8],
+    ) -> Result<(), crate::ExportKeyingMaterialError> {
+        if !self.is_established() {
+            return Err(crate::ExportKeyingMaterialError);
+        }
+        self.tls_exporter
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .ok_or(crate::ExportKeyingMaterialError)?
+            .export_keying_material(output, label, context)
+            .map_err(|_| crate::ExportKeyingMaterialError)
+    }
+
+    #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
+    pub(crate) fn set_tls_exporter(&self, exporter: quion_proto::crypto::rustls::RustlsExporter) {
+        *self.tls_exporter.lock().unwrap_or_else(|p| p.into_inner()) = Some(exporter);
     }
 
     /// Returns whether TLS and QUIC handshake processing completed.
@@ -3037,7 +3071,18 @@ impl Connection {
                         self.ensure_closed(ConnectionError::Reset);
                     }
                 }
-                ConnectionEvent::StreamFrameQueued { stream_id, .. } => {
+                ConnectionEvent::StreamFrameQueued {
+                    stream_id,
+                    offset,
+                    len,
+                    fin,
+                } => {
+                    if *fin {
+                        self.stream_reset_state
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .set_final_size(*stream_id, offset + *len as u64);
+                    }
                     self.wake_accept_streams(*stream_id);
                     self.wake_stream_reader(*stream_id);
                 }
@@ -3061,10 +3106,27 @@ impl Connection {
                 ConnectionEvent::StreamReset {
                     stream_id,
                     error_code,
-                    ..
+                    final_size,
                 } => {
+                    self.stream_reset_state
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .set_final_size(*stream_id, final_size.into_inner());
                     self.wake_accept_streams(*stream_id);
                     self.note_stream_reset(*stream_id, *error_code);
+                }
+                ConnectionEvent::FrameReceived(quion_proto::frame::Frame::ResetStreamAt {
+                    stream_id,
+                    final_size,
+                    ..
+                }) => {
+                    let id = StreamId(*stream_id);
+                    self.stream_reset_state
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .set_final_size(id, final_size.into_inner());
+                    self.wake_accept_streams(id);
+                    self.wake_stream_reader(id);
                 }
                 ConnectionEvent::FrameReceived(quion_proto::frame::Frame::MaxStreamData {
                     stream_id,
@@ -4398,6 +4460,7 @@ impl StreamStopState {
 pub(crate) struct StreamResetState {
     active: std::collections::BTreeSet<StreamId>,
     reasons: std::collections::BTreeMap<StreamId, VarInt>,
+    final_sizes: std::collections::BTreeMap<StreamId, u64>,
     waiters: std::collections::BTreeMap<StreamId, Waker>,
 }
 
@@ -4409,7 +4472,18 @@ impl StreamResetState {
     pub(crate) fn remove_handle(&mut self, id: StreamId) {
         self.active.remove(&id);
         self.reasons.remove(&id);
+        self.final_sizes.remove(&id);
         self.waiters.remove(&id);
+    }
+
+    pub(crate) fn final_size(&self, id: StreamId) -> Option<u64> {
+        self.final_sizes.get(&id).copied()
+    }
+
+    pub(crate) fn set_final_size(&mut self, id: StreamId, size: u64) {
+        if self.active.contains(&id) {
+            self.final_sizes.entry(id).or_insert(size);
+        }
     }
 
     pub(crate) fn reset_reason(&self, stream_id: StreamId) -> Option<VarInt> {
@@ -5067,6 +5141,34 @@ mod tests {
         thread,
         time::Duration,
     };
+
+    #[test]
+    fn final_sizes_are_retained_only_for_live_receive_handles() {
+        let id = StreamId(VarInt::from_u32(3));
+        let mut state = StreamResetState::default();
+        state.set_final_size(id, 10);
+        assert_eq!(state.final_size(id), None);
+        state.register_handle(id);
+        state.set_final_size(id, 10);
+        assert_eq!(state.final_size(id), Some(10));
+        state.remove_handle(id);
+        assert!(state.final_sizes.is_empty());
+        state.set_final_size(id, 10);
+        assert!(state.final_sizes.is_empty());
+    }
+
+    #[test]
+    #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
+    fn exporter_requires_a_completed_tls_handshake() {
+        let connection = Connection::new(
+            "127.0.0.1:4433".parse().unwrap(),
+            "127.0.0.1:4434".parse().unwrap(),
+        );
+        assert_eq!(
+            connection.export_keying_material(&mut [0; 32], b"EXPORTER-test", b"context"),
+            Err(crate::ExportKeyingMaterialError)
+        );
+    }
 
     fn counting_waker(count: Arc<AtomicUsize>) -> Waker {
         #[derive(Debug)]

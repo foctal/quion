@@ -165,6 +165,7 @@ struct SendStreamState {
     stopped_error: Option<VarInt>,
     reliable_reset: Option<(VarInt, u64, u64)>,
     fin_acked: bool,
+    reliable_reset_acked: bool,
 }
 
 impl SendStreamState {
@@ -178,6 +179,7 @@ impl SendStreamState {
             stopped_error: None,
             reliable_reset: None,
             fin_acked: false,
+            reliable_reset_acked: false,
         }
     }
 }
@@ -1582,6 +1584,14 @@ impl Connection {
             if stream.stopped_error.is_some() {
                 return Ok(Effects::default());
             }
+            if stream
+                .reliable_reset
+                .is_some_and(|(existing, _, _)| existing != error_code)
+            {
+                return Err(crate::error::CodecError::Transport(
+                    TransportErrorCode::StreamStateError,
+                ));
+            }
             (stream.buffer.reset_final_size(), stream.buffer.queued_len())
         };
         let final_size = VarInt::new(final_size)?;
@@ -1597,6 +1607,7 @@ impl Connection {
         };
         self.send_buffered_stream_data = self.send_buffered_stream_data.saturating_sub(queued_len);
         self.pending_send_streams.remove(&stream_id);
+        self.stream_schedule.retain(|queued| *queued != stream_id);
         stream.stopped_error = Some(error_code);
         stream.queued = false;
         stream.buffer = SendBuffer::default();
@@ -1671,6 +1682,7 @@ impl Connection {
         let (_, discarded) = stream
             .buffer
             .prepare_reliable_reset(reliable_size.into_inner())?;
+        stream.reliable_reset_acked = false;
         stream.reliable_reset = Some((
             error_code,
             final_size.into_inner(),
@@ -1680,8 +1692,14 @@ impl Connection {
         self.send_retransmit_streams.retain_mut(|frame| {
             trim_stream_frame_to_reliable(frame, stream_id, reliable_size.into_inner())
         });
-        self.pending_send_streams.insert(stream_id);
-        self.mark_stream_schedulable(stream_id);
+        if stream.buffer.is_empty() {
+            self.pending_send_streams.remove(&stream_id);
+            stream.queued = false;
+            self.stream_schedule.retain(|queued| *queued != stream_id);
+        } else {
+            self.pending_send_streams.insert(stream_id);
+            self.mark_stream_schedulable(stream_id);
+        }
         self.qlog_events.push(QlogEvent::StreamStateUpdated {
             stream_id: stream_id.0.into_inner(),
             state: "reliable_reset_sent",
@@ -2217,6 +2235,11 @@ impl Connection {
             .is_some_and(|stream| stream.buffered_bytes() != 0)
     }
 
+    /// Returns the final size while receive state is retained.
+    pub fn recv_stream_final_size(&self, stream_id: StreamId) -> Option<u64> {
+        self.recv_streams.recv_stream(stream_id)?.final_offset()
+    }
+
     pub fn recv_stream_reset_error(&self, stream_id: StreamId) -> Option<VarInt> {
         self.recv_streams.recv_stream(stream_id)?.reset_error()
     }
@@ -2382,8 +2405,12 @@ impl Connection {
             if level == EncryptionLevel::OneRtt {
                 for packet_level in [EncryptionLevel::ZeroRtt, EncryptionLevel::OneRtt] {
                     self.sent_crypto.remove(&(packet_level, packet_number));
-                    if let Some(frame) = self.sent_control.remove(&(packet_level, packet_number)) {
-                        self.on_control_frame_acked(packet_number, &frame);
+                    if let Some(frame) = self.sent_control.remove(&(packet_level, packet_number))
+                        && let Some(stream_id) = self.on_control_frame_acked(packet_number, &frame)
+                    {
+                        effects
+                            .connection_events
+                            .push(ConnectionEvent::StreamFinished { stream_id });
                     }
                     if let Some(frame) = self.remove_sent_stream((packet_level, packet_number)) {
                         if let Some(stream_id) = self.on_stream_frame_acked(&frame) {
@@ -2396,8 +2423,12 @@ impl Connection {
                 }
             } else {
                 self.sent_crypto.remove(&(level, packet_number));
-                if let Some(frame) = self.sent_control.remove(&(level, packet_number)) {
-                    self.on_control_frame_acked(packet_number, &frame);
+                if let Some(frame) = self.sent_control.remove(&(level, packet_number))
+                    && let Some(stream_id) = self.on_control_frame_acked(packet_number, &frame)
+                {
+                    effects
+                        .connection_events
+                        .push(ConnectionEvent::StreamFinished { stream_id });
                 }
                 if let Some(frame) = self.remove_sent_stream((level, packet_number)) {
                     if let Some(stream_id) = self.on_stream_frame_acked(&frame) {
@@ -3085,7 +3116,10 @@ impl Connection {
     pub fn has_immediate_transmit(&self) -> bool {
         !self.send_acks.is_empty()
             || (self.can_send_one_rtt(1)
-                && (!self.send_control.is_empty()
+                && (self
+                    .send_control
+                    .iter()
+                    .any(|frame| self.control_frame_has_credit(frame))
                     || !self.send_datagrams.is_empty()
                     || !self.send_retransmit_streams.is_empty()))
             || (!self.stream_schedule.is_empty()
@@ -3157,7 +3191,7 @@ impl Connection {
                 stream.buffer = SendBuffer::default();
                 continue;
             }
-            let Some(chunk) = stream.buffer.poll_frame_with_connection_flow_reusing(
+            let Some(mut chunk) = stream.buffer.poll_frame_with_connection_flow_reusing(
                 &mut stream.flow,
                 Some(&mut self.send_flow),
                 self.scheduler.max_frame_data,
@@ -3195,11 +3229,14 @@ impl Connection {
             self.send_buffered_stream_data = self
                 .send_buffered_stream_data
                 .saturating_sub(chunk.bytes.len());
-            if chunk.fin {
+            chunk.fin &= stream.reliable_reset.is_none();
+            if chunk.fin || (stream.reliable_reset.is_some() && stream.buffer.is_empty()) {
                 self.pending_send_streams.remove(&stream_id);
             }
             if !stream.buffer.is_empty()
-                || (stream.buffer.final_offset() == Some(stream.buffer.next_offset()) && !chunk.fin)
+                || (stream.reliable_reset.is_none()
+                    && stream.buffer.final_offset() == Some(stream.buffer.next_offset())
+                    && !chunk.fin)
             {
                 self.mark_stream_schedulable(stream_id);
             }
@@ -3330,24 +3367,39 @@ impl Connection {
         self.commit_transmit(level, bytes, ack_eliciting, now);
     }
 
-    fn on_control_frame_acked(&mut self, packet_number: u64, frame: &Frame) {
+    fn on_control_frame_acked(&mut self, packet_number: u64, frame: &Frame) -> Option<StreamId> {
+        if let Frame::ResetStreamAt {
+            stream_id,
+            reliable_size,
+            ..
+        } = frame
+        {
+            let id = StreamId(*stream_id);
+            if let Some(stream) = self.send_streams.get_mut(&id)
+                && stream
+                    .reliable_reset
+                    .is_some_and(|(_, _, size)| size == reliable_size.into_inner())
+            {
+                stream.reliable_reset_acked = true;
+            }
+            return self.try_close_send_stream(id).then_some(id);
+        }
         if let Frame::ResetStream { stream_id, .. } = frame {
             self.close_reset_send_stream(StreamId(*stream_id));
-            return;
+            return None;
         }
         if !matches!(frame, Frame::AckFrequency { .. })
             || self
                 .in_flight_ack_frequency
                 .is_none_or(|(in_flight, _)| in_flight != packet_number)
         {
-            return;
+            return None;
         }
-        let Some((_, requested)) = self.in_flight_ack_frequency.take() else {
-            return;
-        };
+        let (_, requested) = self.in_flight_ack_frequency.take()?;
         self.peer_max_ack_delay = requested;
         self.recovery
             .set_ack_delay_config(self.peer_max_ack_delay, self.peer_ack_delay_exponent);
+        None
     }
 
     fn close_reset_send_stream(&mut self, stream_id: StreamId) {
@@ -3400,7 +3452,61 @@ impl Connection {
     }
 
     fn poll_control_frame(&mut self) -> Option<Frame> {
-        self.send_control.pop_front()
+        let count = self.send_control.len();
+        for _ in 0..count {
+            let frame = self.send_control.pop_front()?;
+            if self.charge_reset_final_size(&frame) {
+                return Some(frame);
+            }
+            self.send_control.push_back(frame);
+        }
+        None
+    }
+
+    fn control_frame_has_credit(&self, frame: &Frame) -> bool {
+        let (stream_id, final_size) = match frame {
+            Frame::ResetStream {
+                stream_id,
+                final_size,
+                ..
+            }
+            | Frame::ResetStreamAt {
+                stream_id,
+                final_size,
+                ..
+            } => (StreamId(*stream_id), final_size.into_inner()),
+            _ => return true,
+        };
+        self.send_streams.get(&stream_id).is_none_or(|stream| {
+            final_size <= stream.flow.max_data()
+                && final_size.saturating_sub(stream.flow.consumed()) <= self.send_flow.available()
+        })
+    }
+
+    fn charge_reset_final_size(&mut self, frame: &Frame) -> bool {
+        if !self.control_frame_has_credit(frame) {
+            return false;
+        }
+        let (stream_id, final_size) = match frame {
+            Frame::ResetStream {
+                stream_id,
+                final_size,
+                ..
+            }
+            | Frame::ResetStreamAt {
+                stream_id,
+                final_size,
+                ..
+            } => (StreamId(*stream_id), final_size.into_inner()),
+            _ => return true,
+        };
+        let Some(stream) = self.send_streams.get_mut(&stream_id) else {
+            return true;
+        };
+        let additional = final_size.saturating_sub(stream.flow.consumed());
+        stream.flow.consume(additional);
+        self.send_flow.consume(additional);
+        true
     }
 
     fn remove_sent_stream(&mut self, key: (EncryptionLevel, u64)) -> Option<Frame> {
@@ -3439,8 +3545,11 @@ impl Connection {
 
     fn try_close_send_stream(&mut self, stream_id: StreamId) -> bool {
         let terminal = self.send_streams.get(&stream_id).is_some_and(|stream| {
-            stream.fin_acked
-                && stream.buffer.is_empty()
+            (if stream.reliable_reset.is_some() {
+                stream.reliable_reset_acked
+            } else {
+                stream.fin_acked
+            }) && stream.buffer.is_empty()
                 && stream.buffer.final_offset().is_some()
                 && !stream.queued
         });
@@ -3455,19 +3564,17 @@ impl Connection {
                 matches!(
                     frame,
                     Frame::Stream {
-                        stream_id: queued,
+                        stream_id: queued, offset,
                         ..
-                    } if *queued == stream_id.0
+                    } if *queued == stream_id.0 && self.send_streams.get(&stream_id)
+                        .and_then(|stream| stream.reliable_reset)
+                        .is_none_or(|(_, _, size)| offset.into_inner() < size)
                 )
             });
         if has_outstanding {
             return false;
         }
-        self.send_streams.remove(&stream_id);
-        self.stream_schedule.retain(|queued| *queued != stream_id);
-        let stream_type = (stream_id.0.into_inner() & 0x03) as usize;
-        let ordinal = stream_id.ordinal();
-        self.closed_send_streams[stream_type].insert(ordinal, ordinal.saturating_add(1));
+        self.close_reset_send_stream(stream_id);
         true
     }
 
@@ -3483,7 +3590,13 @@ impl Connection {
             .send_control
             .iter()
             .position(|frame| frame_allowed_at_level(frame, EncryptionLevel::ZeroRtt))?;
-        self.send_control.remove(position)
+        let frame = self.send_control.remove(position)?;
+        if self.charge_reset_final_size(&frame) {
+            Some(frame)
+        } else {
+            self.send_control.push_back(frame);
+            None
+        }
     }
 
     fn poll_datagram_frame(&mut self) -> Option<Frame> {
@@ -3585,12 +3698,38 @@ impl Connection {
 
     fn requeue_frame_front(&mut self, frame: Frame) {
         match frame {
+            Frame::ResetStreamAt { stream_id, .. } => {
+                let Some(stream) = self.send_streams.get(&StreamId(stream_id)) else {
+                    return;
+                };
+                if stream.stopped_error.is_some() || stream.reliable_reset_acked {
+                    return;
+                }
+                if let Some((error_code, final_size, reliable_size)) = stream.reliable_reset {
+                    self.queue_control_frame_front_best_effort(Frame::ResetStreamAt {
+                        stream_id,
+                        error_code,
+                        final_size: VarInt::new(final_size).unwrap(),
+                        reliable_size: VarInt::new(reliable_size).unwrap(),
+                    });
+                }
+            }
+            Frame::ResetStream { stream_id, .. }
+                if self.is_send_stream_finished(StreamId(stream_id)) => {}
             Frame::Datagram { data } => {
                 self.send_datagrams_bytes = self.send_datagrams_bytes.saturating_add(data.len());
                 self.send_datagrams.push_front(data);
             }
             Frame::Stream { stream_id, .. } => {
                 let stream_id = StreamId(stream_id);
+                if self.is_send_stream_finished(stream_id)
+                    || self
+                        .send_streams
+                        .get(&stream_id)
+                        .is_some_and(|stream| stream.stopped_error.is_some())
+                {
+                    return;
+                }
                 let reliable_size = self
                     .send_streams
                     .get(&stream_id)
@@ -3748,7 +3887,7 @@ impl Connection {
         if self.is_send_stream_finished(stream_id) {
             return Ok(false);
         }
-        let (final_size, queued_len) = {
+        let (final_size, queued_len, reset_error) = {
             let stream = self
                 .send_streams
                 .entry(stream_id)
@@ -3759,11 +3898,14 @@ impl Connection {
             (
                 VarInt::new(stream.buffer.reset_final_size()).unwrap_or(VarInt::MAX),
                 stream.buffer.queued_len(),
+                stream
+                    .reliable_reset
+                    .map_or(error_code, |(code, _, _)| code),
             )
         };
         self.queue_control_frame(Frame::ResetStream {
             stream_id: stream_id.0,
-            error_code,
+            error_code: reset_error,
             final_size,
         })?;
         let Some(stream) = self.send_streams.get_mut(&stream_id) else {
@@ -3773,6 +3915,7 @@ impl Connection {
         };
         self.send_buffered_stream_data = self.send_buffered_stream_data.saturating_sub(queued_len);
         self.pending_send_streams.remove(&stream_id);
+        self.stream_schedule.retain(|queued| *queued != stream_id);
         stream.stopped_error = Some(error_code);
         stream.queued = false;
         stream.buffer = SendBuffer::default();
@@ -4033,6 +4176,7 @@ fn frame_requires_connection_event(frame: &Frame) -> bool {
         Frame::ConnectionClose { .. }
             | Frame::ApplicationClose { .. }
             | Frame::PathChallenge(_)
+            | Frame::ResetStreamAt { .. }
             | Frame::MaxStreamData { .. }
             | Frame::MaxData(_)
             | Frame::MaxStreamsBidi(_)
@@ -6106,6 +6250,8 @@ mod tests {
         let mut conn = Connection::new();
         let stream_id = StreamId(VarInt::from_u32(0));
         let sent_at = web_time::Instant::now() - web_time::Duration::from_millis(20);
+        conn.increase_connection_send_limit(5);
+        conn.increase_stream_send_limit(stream_id, 5).unwrap();
         conn.queue_stream_data(stream_id, b"hello").unwrap();
         conn.reset_stream(stream_id, VarInt::from_u32(42)).unwrap();
         let sent = conn.poll_transmit(sent_at).unwrap();
@@ -6140,6 +6286,178 @@ mod tests {
                 error_code: VarInt::from_u32(42),
                 final_size: VarInt::from_u32(5),
             }
+        );
+    }
+
+    #[test]
+    fn reliable_prefix_arriving_before_reset_is_not_eof() {
+        let mut sender = Connection::new();
+        let mut receiver = Connection::new();
+        receiver.configure_inbound_stream_limits(StreamInitiator::Server, 100, 100);
+        sender.set_reset_stream_at_enabled(true);
+        receiver.set_reset_stream_at_enabled(true);
+        sender.increase_connection_send_limit(6);
+        let id = StreamId(VarInt::ZERO);
+        sender.increase_stream_send_limit(id, 6).unwrap();
+        sender.queue_stream_data(id, b"header").unwrap();
+        sender
+            .reset_stream_at(id, VarInt::from_u32(42), VarInt::from_u32(6))
+            .unwrap();
+        let reset = sender.poll_control_frame().unwrap();
+        let data = sender.poll_stream_frame().unwrap();
+        let now = Instant::now();
+        // Model a lost reset packet: its STREAM prefix reaches the application first.
+        receiver
+            .handle_frame(EncryptionLevel::OneRtt, data, now)
+            .unwrap();
+        let chunk = receiver.read_recv_stream(id, 6, true).unwrap();
+        assert!(!chunk.fin);
+        assert_eq!(&chunk.bytes[..], b"header");
+        assert!(!receiver.is_recv_stream_finished(id));
+        sender.requeue_frame_front(reset);
+        let retransmitted_reset = sender.poll_control_frame().unwrap();
+        receiver
+            .handle_frame(EncryptionLevel::OneRtt, retransmitted_reset, now)
+            .unwrap();
+        assert_eq!(
+            receiver.recv_stream_reset_error(id),
+            Some(VarInt::from_u32(42))
+        );
+    }
+
+    #[test]
+    fn reliable_reset_acknowledgement_reclaims_state_without_fin() {
+        for prefix in [0, 6, 10] {
+            for reset_acked_first in [true, false] {
+                let mut conn = Connection::new();
+                conn.set_reset_stream_at_enabled(true);
+                conn.increase_connection_send_limit(10);
+                let id = StreamId(VarInt::ZERO);
+                conn.increase_stream_send_limit(id, 10).unwrap();
+                conn.queue_stream_data(id, b"headerdata").unwrap();
+                conn.reset_stream_at(id, VarInt::from_u32(42), VarInt::from_u32(prefix))
+                    .unwrap();
+                let now = Instant::now();
+                let reset = conn.poll_transmit(now).unwrap();
+                assert!(matches!(
+                    Frame::decode(&reset.contents).unwrap().0,
+                    Frame::ResetStreamAt { .. }
+                ));
+                assert_eq!(conn.send_flow.consumed(), 10);
+                if prefix > 0 {
+                    let data = conn.poll_transmit(now).unwrap();
+                    assert!(matches!(Frame::decode(&data.contents).unwrap().0,
+                        Frame::Stream { fin: false, data, .. } if data.len() == prefix as usize));
+                }
+                assert_eq!(conn.send_flow.consumed(), 10, "prefix was charged twice");
+                assert!(!conn.is_send_stream_finished(id));
+                let packets = if prefix == 0 {
+                    vec![0]
+                } else if reset_acked_first {
+                    vec![0, 1]
+                } else {
+                    vec![1, 0]
+                };
+                for (index, pn) in packets.iter().enumerate() {
+                    let effects = conn.handle_ack_frame(
+                        EncryptionLevel::OneRtt,
+                        &Frame::Ack {
+                            largest: VarInt::from_u32(*pn),
+                            delay: VarInt::ZERO,
+                            first_range: VarInt::ZERO,
+                            ranges: Default::default(),
+                            ecn: None,
+                        },
+                        now + Duration::from_millis(1),
+                    );
+                    let done = index + 1 == packets.len();
+                    assert_eq!(conn.is_send_stream_finished(id), done);
+                    assert_eq!(
+                        effects
+                            .connection_events
+                            .contains(&ConnectionEvent::StreamFinished { stream_id: id }),
+                        done
+                    );
+                }
+                assert!(conn.send_streams.is_empty());
+                assert_eq!(conn.send_buffered_stream_data(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn reset_final_size_waits_for_credit_and_is_charged_once() {
+        for reliable in [false, true] {
+            let mut conn = Connection::new();
+            conn.set_reset_stream_at_enabled(true);
+            let id = StreamId(VarInt::ZERO);
+            conn.queue_stream_data(id, b"headerdata").unwrap();
+            if reliable {
+                conn.reset_stream_at(id, VarInt::from_u32(42), VarInt::ZERO)
+                    .unwrap();
+            } else {
+                conn.reset_stream(id, VarInt::from_u32(42)).unwrap();
+            }
+            assert!(conn.poll_control_frame().is_none());
+            assert!(!conn.has_immediate_transmit());
+            conn.increase_stream_send_limit(id, 10).unwrap();
+            assert!(conn.poll_control_frame().is_none());
+            conn.increase_connection_send_limit(10);
+            let reset = conn.poll_control_frame().unwrap();
+            assert_eq!(conn.send_flow.consumed(), 10);
+            conn.requeue_frame_front(reset.clone());
+            assert_eq!(conn.poll_control_frame(), Some(reset));
+            assert_eq!(conn.send_flow.consumed(), 10);
+        }
+    }
+
+    #[test]
+    fn reliable_reset_retransmits_prefix_and_preserves_code_on_stop() {
+        let mut conn = Connection::new();
+        conn.set_reset_stream_at_enabled(true);
+        conn.increase_connection_send_limit(10);
+        let id = StreamId(VarInt::ZERO);
+        conn.increase_stream_send_limit(id, 10).unwrap();
+        conn.queue_stream_data(id, b"headerdata").unwrap();
+        let data = conn.poll_stream_frame().unwrap();
+        conn.reset_stream_at(id, VarInt::from_u32(42), VarInt::from_u32(6))
+            .unwrap();
+        conn.requeue_frame_front(data);
+        assert!(
+            matches!(conn.poll_retransmit_stream_frame(), Some(Frame::Stream { fin: false, data, .. }) if data == b"header"[..])
+        );
+        assert!(conn.reset_stream(id, VarInt::from_u32(99)).is_err());
+        assert!(conn.stop_send_stream(id, VarInt::from_u32(99)).unwrap());
+        assert!(conn.send_control.iter().any(|frame| matches!(frame,
+            Frame::ResetStream { error_code, final_size, .. }
+                if *error_code == VarInt::from_u32(42) && *final_size == VarInt::from_u32(10))));
+    }
+
+    #[test]
+    fn lost_reliable_reset_uses_the_smallest_current_prefix() {
+        let mut conn = Connection::new();
+        conn.set_reset_stream_at_enabled(true);
+        conn.increase_connection_send_limit(10);
+        let id = StreamId(VarInt::ZERO);
+        conn.increase_stream_send_limit(id, 10).unwrap();
+        conn.queue_stream_data(id, b"headerdata").unwrap();
+        conn.reset_stream_at(id, VarInt::from_u32(42), VarInt::from_u32(6))
+            .unwrap();
+        let old_reset = conn.poll_control_frame().unwrap();
+        conn.reset_stream_at(id, VarInt::from_u32(42), VarInt::from_u32(3))
+            .unwrap();
+        conn.requeue_frame_front(old_reset.clone());
+        let current_reset = conn.poll_control_frame().unwrap();
+        assert!(
+            matches!(current_reset, Frame::ResetStreamAt { reliable_size, .. } if reliable_size == VarInt::from_u32(3))
+        );
+        assert_eq!(conn.on_control_frame_acked(0, &old_reset), None);
+        assert!(!conn.send_streams[&id].reliable_reset_acked);
+        assert_eq!(conn.on_control_frame_acked(1, &current_reset), None);
+        conn.requeue_frame_front(old_reset);
+        assert!(conn.poll_control_frame().is_none());
+        assert!(
+            matches!(conn.poll_stream_frame(), Some(Frame::Stream { fin: false, data, .. }) if data == b"hea"[..])
         );
     }
 
