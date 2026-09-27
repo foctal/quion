@@ -112,6 +112,62 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dual_stack_sender_reaches_ipv4_with_source_and_ecn() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        use std::time::{Duration, Instant};
+
+        let sender = UdpSocket::bind("[::]:0".parse().unwrap()).unwrap();
+        let receiver = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let destination = SocketAddr::new(
+            IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()),
+            receiver.local_addr().unwrap().port(),
+        );
+        let sources = [
+            Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+            None,
+            Some(IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped())),
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        ];
+        for source in sources {
+            for ecn in [None, Some(EcnCodepoint::Ect0), Some(EcnCodepoint::Ect1)] {
+                for batch in [false, true] {
+                    let transmit = Transmit {
+                        destination,
+                        source: source
+                            .map(|ip| SocketAddr::new(ip, sender.local_addr().unwrap().port())),
+                        ecn,
+                        contents: b"dual-stack".to_vec(),
+                        segment_size: None,
+                        send_at: None,
+                    };
+                    if batch {
+                        let mut send = BatchSend::default();
+                        send.push(transmit);
+                        assert_eq!(sender.send_batch(&send).unwrap(), 1);
+                    } else {
+                        sender.send(&transmit).unwrap();
+                    }
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    let mut buffer = [0; 64];
+                    let meta = loop {
+                        if let Some(meta) = receiver.recv(&mut buffer).unwrap() {
+                            break meta;
+                        }
+                        assert!(Instant::now() < deadline, "dual-stack datagram timed out");
+                        std::thread::yield_now();
+                    };
+                    assert_eq!(&buffer[..meta.len], b"dual-stack");
+                    assert_eq!(meta.remote.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+                    if receiver.ecn_capabilities().read {
+                        assert_eq!(meta.ecn, ecn);
+                    }
+                }
+            }
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_rejects_sender_congestion_marking_without_sending_a_packet() {
