@@ -930,6 +930,7 @@ impl Endpoint {
             for connection in state.connections.iter().map(|(_, connection)| connection) {
                 connection.abort();
             }
+            state.aborted = true;
             state.connections.clear();
             state.routes.clear();
             state.route_cid_lengths.clear();
@@ -973,6 +974,7 @@ impl Endpoint {
             for connection in state.connections.iter().map(|(_, connection)| connection) {
                 connection.abort();
             }
+            state.aborted = true;
             state.connections.clear();
             state.routes.clear();
             state.route_cid_lengths.clear();
@@ -4171,7 +4173,12 @@ impl Endpoint {
         // Abort can clear endpoint state while a batch is polled outside this
         // lock. Do not resurrect a terminal driver when returning that batch.
         drivers.retain(|_id, owned| {
-            if !owned.connection.runtime_shutdown_ready() {
+            // A packet routed before abort can be queued after abort cleared
+            // the connection, making runtime_shutdown_ready false again.
+            if state.aborted {
+                owned.connection.abort();
+            }
+            if !state.aborted && !owned.connection.runtime_shutdown_ready() {
                 return true;
             }
             #[cfg(all(
@@ -4814,6 +4821,7 @@ struct EndpointState {
     incoming: VecDeque<Incoming>,
     accept_waker: Option<Waker>,
     closed: bool,
+    aborted: bool,
     proto_endpoint: quion_proto::endpoint::Endpoint,
     connections: Slab<Connection>,
     routes: BTreeMap<quion_proto::cid::ConnectionId, EndpointConnectionRoute>,
@@ -9057,6 +9065,49 @@ mod tests {
         endpoint.restore_endpoint_one_rtt_drivers(polled);
         assert!(endpoint.runtime_shutdown_ready());
         assert_eq!(endpoint.endpoint_driver_scheduler.registered_len(), 0);
+    }
+
+    #[cfg(all(
+        feature = "runtime-tokio",
+        any(feature = "rustls-ring", feature = "rustls-aws-lc-rs")
+    ))]
+    #[tokio::test]
+    async fn restoring_polled_drivers_after_abort_discards_late_routed_datagrams() {
+        let endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connection = Connection::new(endpoint.local_addr(), "127.0.0.1:9".parse().unwrap());
+        let cid = quion_proto::cid::ConnectionId::from_slice(b"driver").unwrap();
+        let driver = ProtectedOneRttUdpDriver::new(
+            quion_proto::crypto::packet::FramePacketBuilder::new(cid.clone()),
+            quion_proto::crypto::rustls::RustlsKeyStore::default(),
+            6,
+        );
+        let driver_id = {
+            let mut state = endpoint.state.lock().unwrap();
+            state.register_connection(cid, connection.clone()).unwrap();
+            state.store_endpoint_one_rtt_driver(connection.clone(), driver)
+        };
+        endpoint.activate_endpoint_one_rtt_driver(&connection, driver_id);
+        let polled = endpoint.take_endpoint_one_rtt_drivers();
+        endpoint.abort();
+
+        // Routing can retain a connection before abort and enqueue its packet
+        // after abort clears the queue, while the driver batch is still polled.
+        let meta = quion_udp::RecvMeta {
+            local: Some(endpoint.local_addr()),
+            remote: connection.remote_address(),
+            interface: None,
+            ecn: None,
+            segment_size: None,
+            len: 4,
+        };
+        assert!(endpoint.enqueue_connection_routed_datagram(&connection, meta, &[1; 4]));
+        assert_eq!(endpoint.endpoint_memory_budget.used_bytes(), 4);
+        endpoint.restore_endpoint_one_rtt_drivers(polled);
+
+        assert!(endpoint.runtime_shutdown_ready());
+        assert_eq!(endpoint.endpoint_driver_scheduler.registered_len(), 0);
+        assert_eq!(endpoint.endpoint_memory_budget.used_bytes(), 0);
+        assert_eq!(connection.routed_datagram_len(), 0);
     }
 
     #[cfg(all(
