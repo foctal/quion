@@ -992,7 +992,7 @@ dependencies = [
 
 [[package]]
 name = "quion"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "dhat",
@@ -1017,7 +1017,7 @@ dependencies = [
 
 [[package]]
 name = "quion-fuzz"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "libfuzzer-sys",
  "quion-proto",
@@ -1028,11 +1028,11 @@ dependencies = [
 
 [[package]]
 name = "quion-h3"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "quion-proto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aes-gcm",
  "arbitrary",
@@ -1059,7 +1059,7 @@ dependencies = [
 
 [[package]]
 name = "quion-udp"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "libc",
  "smallvec",
