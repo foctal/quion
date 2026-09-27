@@ -1,0 +1,15 @@
+[package]
+name = "quion-h3"
+description = "Experimental HTTP/3 support for quion."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,65 @@
+[package]
+name = "quion-proto"
+description = "Sans-IO QUIC protocol core for quion."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "../README.md"
+keywords = ["quic", "networking", "sans-io", "transport"]
+categories = ["network-programming"]
+
+[features]
+default = ["datagram", "qlog"]
+rustls-ring = ["dep:rustls", "dep:ring", "rustls/ring"]
+# Initial packet protection currently uses ring's standalone QUIC primitives
+# independently of the rustls TLS crypto provider.
+rustls-aws-lc-rs = ["dep:rustls", "dep:ring", "dep:aws-lc-rs", "rustls/aws-lc-rs"]
+datagram = []
+qlog = ["dep:qlog", "dep:serde", "dep:serde_json"]
+zero-rtt = []
+connection-migration = []
+unstable-bbr3 = []
+unstable-multipath = []
+unstable-address-discovery = []
+unstable-nat-traversal = []
+arbitrary = ["dep:arbitrary"]
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rustls = { workspace = true, optional = true }
+ring = { workspace = true, optional = true }
+smallvec.workspace = true
+aws-lc-rs = { workspace = true, optional = true }
+tinyvec.workspace = true
+rand.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+web-time.workspace = true
+aes-gcm.workspace = true
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+qlog = { workspace = true, optional = true }
+arbitrary = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace = true
+rcgen.workspace = true
+time.workspace = true
+quinn-proto-reference = { package = "quinn-proto", version = "=0.11.16", default-features = false }
+
+[[bench]]
+name = "congestion"
+harness = false
+
+[[bench]]
+name = "hot_paths"
+harness = false
+required-features = ["rustls-ring"]
+
+[lints]
+workspace = true

@@ -1,0 +1,39 @@
+[package]
+name = "quion-udp"
+description = "UDP socket support for quion."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "../README.md"
+keywords = ["udp", "networking", "quic"]
+categories = ["network-programming"]
+
+[features]
+default = []
+gso = []
+gro = []
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+socket2.workspace = true
+libc.workspace = true
+web-time.workspace = true
+smallvec.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_System_IO",
+] }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "udp"
+harness = false

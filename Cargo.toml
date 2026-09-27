@@ -1,0 +1,64 @@
+[workspace]
+members = [
+    "quion",
+    "quion-proto",
+    "quion-udp",
+    "quion-h3",
+    "fuzz",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["shellrow <shellrow@foctal.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/foctal/quion"
+rust-version = "1.88"
+
+[workspace.dependencies]
+bytes = "1"
+thiserror = "2"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+rustls = { version = "0.23.45", default-features = false, features = ["std"] }
+rustls-pki-types = "1"
+ring = "0.17"
+aws-lc-rs = { version = "1", default-features = false, features = ["non-fips"] }
+slab = "0.4"
+smallvec = "1.15"
+tinyvec = { version = "1", features = ["alloc"] }
+rustc-hash = "2"
+rand = "0.9"
+hmac = "0.12"
+sha2 = "0.10"
+web-time = "1"
+socket2 = "0.6"
+libc = "0.2"
+tokio = { version = "1", features = ["io-util", "net", "rt", "rt-multi-thread", "sync", "time", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+qlog = "0.17"
+proptest = "1"
+arbitrary = { version = "1", features = ["derive"] }
+rcgen = "0.14"
+aes-gcm = "0.10"
+# Keep certificate-generation tooling on the first release containing the
+# RUSTSEC-2026-0009 stack-exhaustion fix.
+time = "=0.3.47"
+
+[workspace.lints.rust]
+elided_lifetimes_in_paths = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(tokio_unstable)'] }
+unnameable_types = "warn"
+unreachable_pub = "warn"
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+manual_let_else = "warn"
+or_fun_call = "warn"
+use_self = "warn"
+
+[profile.dhat]
+inherits = "release"
+debug = 1
+debug-assertions = true

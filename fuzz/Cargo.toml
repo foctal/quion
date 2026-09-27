@@ -1,0 +1,98 @@
+[package]
+name = "quion-fuzz"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = { version = "0.4", optional = true }
+quion-proto = { path = "../quion-proto", version = "0.1.0", features = ["arbitrary", "rustls-ring"] }
+web-time.workspace = true
+rustls = { workspace = true, optional = true, features = ["ring"] }
+rcgen = { workspace = true, optional = true }
+
+[features]
+default = []
+fuzzing = ["dep:libfuzzer-sys", "dep:rustls", "dep:rcgen"]
+
+[[bin]]
+name = "endpoint_sequence"
+path = "fuzz_targets/endpoint_sequence.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "packet_decode"
+path = "fuzz_targets/packet_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "transport_parameters"
+path = "fuzz_targets/transport_parameters.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "retry_validation"
+path = "fuzz_targets/retry_validation.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "version_negotiation"
+path = "fuzz_targets/version_negotiation.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "crypto_frame_buffer"
+path = "fuzz_targets/crypto_frame_buffer.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "stream_assembler"
+path = "fuzz_targets/stream_assembler.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "protected_initial_open"
+path = "fuzz_targets/protected_initial_open.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "connection_receive"
+path = "fuzz_targets/connection_receive.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "coalesced_packet_decode"
+path = "fuzz_targets/coalesced_packet_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "connection_sequence"
+path = "fuzz_targets/connection_sequence.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "protected_sequence"
+path = "fuzz_targets/protected_sequence.rs"
+test = false
+doc = false

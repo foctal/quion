@@ -1,0 +1,159 @@
+name: Extended validation
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: extended-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-quality:
+    name: Full release quality gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-features
+      - run: cargo doc --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny check
+      - uses: taiki-e/install-action@cargo-fuzz
+      - run: cargo build --manifest-path fuzz/Cargo.toml --all-features
+
+  alternate-crypto:
+    name: AWS-LC crypto backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p quion --no-default-features --features runtime-tokio,rustls-aws-lc-rs,datagram,qlog
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --all-features
+
+  fuzz-smoke:
+    name: Executed fuzz smoke
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - packet_decode
+          - coalesced_packet_decode
+          - frame_decode
+          - transport_parameters
+          - retry_validation
+          - version_negotiation
+          - crypto_frame_buffer
+          - stream_assembler
+          - protected_initial_open
+          - connection_receive
+          - connection_sequence
+          - endpoint_sequence
+          - protected_sequence
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-${{ matrix.target }}-${{ github.sha }}
+          restore-keys: fuzz-${{ matrix.target }}-
+      - name: Load regression seeds
+        shell: bash
+        run: |
+          mkdir -p fuzz/corpus/${{ matrix.target }}
+          if [[ -d fuzz/seeds/${{ matrix.target }} ]]; then
+            cp fuzz/seeds/${{ matrix.target }}/* fuzz/corpus/${{ matrix.target }}/
+          fi
+      - name: Run target
+        working-directory: fuzz
+        run: cargo fuzz run --features fuzzing ${{ matrix.target }} -- -max_total_time=60 -timeout=10
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fuzz-${{ matrix.target }}-${{ github.sha }}
+          path: |
+            fuzz/corpus/${{ matrix.target }}/
+            fuzz/artifacts/${{ matrix.target }}/
+
+  miri:
+    name: Miri core logic
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@miri
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo miri test -p quion-proto varint::tests
+      - run: cargo miri test -p quion-proto ranges::tests
+      - run: cargo miri test -p quion-proto streams::tests
+      - run: cargo miri test -p quion-proto token::tests
+
+  soak:
+    name: Connection, stream, and robustness soak
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: ./scripts/soak.sh
+        env:
+          QUION_SOAK_CONNECTIONS: "100"
+          QUION_SOAK_STREAMS_PER_CONNECTION: "32"
+          QUION_SOAK_DATAGRAMS_PER_CONNECTION: "32"
+          QUION_SOAK_PAYLOAD_BYTES: "16384"
+          QUION_SOAK_TIMEOUT_SECONDS: "300"
+
+  quiche-interop:
+    name: quiche transport interoperability
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: ./scripts/interop/quiche-smoke.sh
+
+  benchmarks:
+    name: Benchmark result collection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo bench -p quion-proto --bench congestion | tee congestion.txt
+      - run: cargo bench -p quion-proto --bench hot_paths | tee hot-paths.txt
+      - run: cargo bench -p quion-udp --bench udp --all-features | tee udp.txt
+      - run: cargo bench -p quion --bench compare_quinn | tee compare-quinn.jsonl
+      - run: QUION_PROFILE_OUTPUT_DIR=allocation-profiles ./scripts/profile-allocations.sh all
+      - run: QUION_RUNTIME_PROFILE_OUTPUT_DIR=runtime-profiles ./scripts/profile-runtime.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.sha }}
+          path: |
+            congestion.txt
+            hot-paths.txt
+            udp.txt
+            compare-quinn.jsonl
+            allocation-profiles/
+            runtime-profiles/

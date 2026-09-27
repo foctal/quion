@@ -1,0 +1,90 @@
+[package]
+name = "quion"
+description = "Pure-Rust QUIC transport with a sans-IO core and async API."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "../README.md"
+keywords = ["quic", "networking", "async", "transport"]
+categories = ["network-programming", "asynchronous"]
+
+[features]
+default = ["runtime-tokio", "rustls-ring", "datagram", "qlog"]
+runtime-tokio = ["dep:tokio"]
+runtime-smol = []
+rustls-ring = ["dep:rustls", "quion-proto/rustls-ring"]
+rustls-aws-lc-rs = ["dep:rustls", "quion-proto/rustls-aws-lc-rs"]
+datagram = ["quion-proto/datagram"]
+qlog = ["quion-proto/qlog"]
+zero-rtt = ["quion-proto/zero-rtt"]
+connection-migration = ["quion-proto/connection-migration"]
+packet-batch = []
+gso = ["quion-udp/gso"]
+gro = ["quion-udp/gro"]
+unstable-bbr3 = ["quion-proto/unstable-bbr3"]
+unstable-multipath = ["quion-proto/unstable-multipath"]
+unstable-address-discovery = ["quion-proto/unstable-address-discovery"]
+unstable-nat-traversal = ["quion-proto/unstable-nat-traversal"]
+wasm = []
+
+[dependencies]
+quion-proto = { path = "../quion-proto", version = "0.1.0", default-features = false }
+quion-udp = { path = "../quion-udp", version = "0.1.0", default-features = false }
+rand.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+rustls = { workspace = true, optional = true }
+rustls-native-certs = "0.8"
+slab.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, optional = true }
+web-time.workspace = true
+bytes.workspace = true
+smallvec.workspace = true
+
+[dev-dependencies]
+quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rcgen.workspace = true
+dhat = "0.3.3"
+stats_alloc = "0.1.10"
+time.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "compare_quinn"
+harness = false
+required-features = ["runtime-tokio", "rustls-ring", "datagram"]
+
+[[example]]
+name = "custom_runtime"
+required-features = ["runtime-tokio"]
+
+[[example]]
+name = "datagram"
+required-features = ["runtime-tokio", "datagram"]
+
+[[example]]
+name = "echo_client"
+required-features = ["runtime-tokio"]
+
+[[example]]
+name = "echo_server"
+required-features = ["runtime-tokio"]
+
+[[example]]
+name = "hq_interop"
+required-features = ["runtime-tokio"]
+
+[[example]]
+name = "insecure_test_connection"
+required-features = ["runtime-tokio"]
+
+[[example]]
+name = "loopback_echo"
+required-features = ["runtime-tokio"]
