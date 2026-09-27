@@ -640,12 +640,12 @@ mod platform {
         transmit: &Transmit,
     ) -> io::Result<()> {
         if let Some(ecn) = transmit.ecn {
-            match transmit.destination {
-                SocketAddr::V4(_) => {
+            match transmit.destination.ip().to_canonical() {
+                IpAddr::V4(_) => {
                     let value = libc::c_int::from(ecn.bits());
                     push_control(message, control, libc::IPPROTO_IP, libc::IP_TOS, &value)?;
                 }
-                SocketAddr::V6(_) => {
+                IpAddr::V6(_) => {
                     let value = libc::c_int::from(ecn.bits());
                     push_control(
                         message,
@@ -658,8 +658,11 @@ mod platform {
             }
         }
 
+        // An unspecified source lets the kernel choose the interface. Passing
+        // IPV6_PKTINFO for :: to an IPv4-mapped peer fails with EINVAL on Linux.
         if let Some(source) = transmit
             .source
+            .filter(|source| !source.ip().is_unspecified())
             .filter(|source| bound_local.ip().is_unspecified() || source.ip() != bound_local.ip())
         {
             push_source_control(message, control, source)?;
@@ -686,7 +689,7 @@ mod platform {
         control: &mut [usize; CONTROL_WORDS],
         source: SocketAddr,
     ) -> io::Result<()> {
-        match source.ip() {
+        match source.ip().to_canonical() {
             IpAddr::V4(address) => {
                 let address = libc::in_addr {
                     s_addr: u32::from(address).to_be(),
