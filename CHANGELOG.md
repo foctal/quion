@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1
+
+- Fix UDP sends to IPv4-mapped destinations on Linux dual-stack sockets by
+  selecting IPv4 control messages for ECN and mapped source addresses and
+  letting the kernel choose the source when an unspecified address is supplied.
+- Add regression coverage for single and batch sends with source-address and
+  ECN combinations.
+
 ## 0.2.0
 
 - Add `Connection::export_keying_material` and `ExportKeyingMaterialError` for
