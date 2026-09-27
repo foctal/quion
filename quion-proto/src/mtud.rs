@@ -1,6 +1,7 @@
 use web_time::{Duration, Instant};
 
 const BASE_PLPMTU: u16 = 1_200;
+#[cfg(any(test, feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
 const MAX_PROBE_ATTEMPTS: u8 = 3;
 const BLACK_HOLE_THRESHOLD: usize = 3;
 
@@ -82,6 +83,13 @@ pub(crate) struct MtuDiscovery {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(
+    not(any(test, feature = "rustls-ring", feature = "rustls-aws-lc-rs")),
+    allow(
+        dead_code,
+        reason = "MTU probe sending requires a rustls backend; ACK and loss handling share this state"
+    )
+)]
 enum Phase {
     Initial,
     Searching(Search),
@@ -89,6 +97,13 @@ enum Phase {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(
+    not(any(test, feature = "rustls-ring", feature = "rustls-aws-lc-rs")),
+    allow(
+        dead_code,
+        reason = "MTU probe sending requires a rustls backend; ACK and loss handling share this state"
+    )
+)]
 struct Search {
     lower: u16,
     upper: u16,
@@ -148,6 +163,7 @@ impl MtuDiscovery {
         }
     }
 
+    #[cfg(any(test, feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
     pub(crate) fn poll_probe(&mut self, now: Instant, packet_number: u64) -> Option<u16> {
         let config = self.config.as_ref()?;
         match self.phase {
@@ -207,6 +223,7 @@ impl MtuDiscovery {
         Some(candidate)
     }
 
+    #[cfg(any(test, feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
     pub(crate) fn on_probe_not_sent(&mut self, packet_number: u64) {
         if let Phase::Searching(search) = &mut self.phase
             && search.in_flight == Some(packet_number)
@@ -315,6 +332,7 @@ impl MtuDiscovery {
     }
 }
 
+#[cfg(any(test, feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
 impl Search {
     fn new(lower: u16, upper: u16) -> Self {
         Self {
@@ -328,6 +346,7 @@ impl Search {
     }
 }
 
+#[cfg(any(test, feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
 fn next_probe_size(lower: u16, upper: u16, previous: u16, minimum_change: u16) -> Option<u16> {
     if upper <= lower {
         return None;

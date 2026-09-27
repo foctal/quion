@@ -439,6 +439,7 @@ impl Frame {
         w.into_vec()
     }
 
+    #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
     pub(crate) fn append_encoded_to(&self, output: &mut Vec<u8>) {
         output.reserve(self.encoded_len());
         let mut w = Writer::from_vec(std::mem::take(output));

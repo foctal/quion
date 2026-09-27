@@ -138,10 +138,7 @@ const DEFAULT_RUNTIME_DRIVER_WORK_PER_TICK: usize = 32;
 // Owning a decrypted packet avoids payload copies, but constructing the shared
 // owner costs more than recycling a small ACK/control packet in place.
 const MIN_OWNED_CLIENT_PACKET_BYTES: usize = 256;
-#[cfg(all(
-    feature = "runtime-tokio",
-    any(feature = "rustls-ring", feature = "rustls-aws-lc-rs")
-))]
+#[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
 const MAX_ENDPOINT_RECV_BATCH: usize = 32;
 
 #[derive(Default)]
@@ -157,19 +154,13 @@ impl RoutedDatagramPool {
     }
 }
 
-#[cfg(all(
-    feature = "runtime-tokio",
-    any(feature = "rustls-ring", feature = "rustls-aws-lc-rs")
-))]
+#[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
 struct PooledRoutedDatagram {
     datagram: Option<RoutedDatagram>,
     pool: Arc<Mutex<RoutedDatagramPool>>,
 }
 
-#[cfg(all(
-    feature = "runtime-tokio",
-    any(feature = "rustls-ring", feature = "rustls-aws-lc-rs")
-))]
+#[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
 impl AsRef<[u8]> for PooledRoutedDatagram {
     fn as_ref(&self) -> &[u8] {
         &self
@@ -180,10 +171,7 @@ impl AsRef<[u8]> for PooledRoutedDatagram {
     }
 }
 
-#[cfg(all(
-    feature = "runtime-tokio",
-    any(feature = "rustls-ring", feature = "rustls-aws-lc-rs")
-))]
+#[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
 impl AsMut<[u8]> for PooledRoutedDatagram {
     fn as_mut(&mut self) -> &mut [u8] {
         &mut self
@@ -194,10 +182,7 @@ impl AsMut<[u8]> for PooledRoutedDatagram {
     }
 }
 
-#[cfg(all(
-    feature = "runtime-tokio",
-    any(feature = "rustls-ring", feature = "rustls-aws-lc-rs")
-))]
+#[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
 impl Drop for PooledRoutedDatagram {
     fn drop(&mut self) {
         let Some(mut datagram) = self.datagram.take() else {
@@ -4253,6 +4238,8 @@ impl Endpoint {
             }
             let mut remove_driver = false;
             let mut next_deadline = None;
+            #[cfg(feature = "runtime-tokio")]
+            let mut made_progress = false;
             if let Some(owned) = drivers.get_mut(&driver_id) {
                 if owned.connection.runtime_shutdown_ready() {
                     remove_driver = true;
@@ -4278,10 +4265,14 @@ impl Endpoint {
                                     next_deadline,
                                     earlier_deadline(progress.next_send_at, progress.next_timeout),
                                 );
-                                if progress.sent_packets == 0
-                                    && progress.received_packets == 0
-                                    && progress.timeouts_processed == 0
+                                let iteration_progress = progress.sent_packets != 0
+                                    || progress.received_packets != 0
+                                    || progress.timeouts_processed != 0;
+                                #[cfg(feature = "runtime-tokio")]
                                 {
+                                    made_progress = iteration_progress;
+                                }
+                                if !iteration_progress {
                                     break;
                                 }
                                 if progress.timeouts_processed != 0 {
@@ -4328,14 +4319,17 @@ impl Endpoint {
                 if drivers.contains_key(&driver_id) {
                     self.endpoint_driver_scheduler
                         .schedule(driver_id, next_deadline);
-                    // Runtime wakeups are edge-triggered and coalesce while a
-                    // driver is already ready. If bounded work leaves
-                    // immediately actionable receive or transmit work,
-                    // restore readiness explicitly. Otherwise no later edge
-                    // is guaranteed to wake the driver.
-                    if drivers
-                        .get(&driver_id)
-                        .is_some_and(|owned| owned.connection.runtime_has_immediate_work())
+                    // Restore readiness when the work budget interrupts progress.
+                    // A poll that made no progress must wait for a new wakeup or
+                    // deadline, even if the protocol still has queued frames.
+                    // Pending paced transmits also block further packet generation,
+                    // but routed receives can still be processed immediately.
+                    if made_progress
+                        && drivers.get(&driver_id).is_some_and(|owned| {
+                            owned.connection.routed_datagram_len() != 0
+                                || (owned.driver.pending_transmits.is_empty()
+                                    && owned.connection.runtime_has_immediate_work())
+                        })
                     {
                         crate::connection::EndpointDriverWakeup::wake_driver(
                             self.endpoint_driver_scheduler.as_ref(),
@@ -4919,7 +4913,9 @@ impl RuntimeWorkLimiter {
     fn record(&mut self, made_progress: bool) -> bool {
         if !made_progress {
             self.work_this_tick = 0;
-            return false;
+            // An idle poll can return immediately because of readiness or an
+            // expired deadline. Yield even when its wait did not suspend.
+            return true;
         }
         self.work_this_tick += 1;
         if self.work_this_tick >= self.max_work_per_tick {
@@ -10262,9 +10258,17 @@ mod tests {
         assert!(!limiter.record(true));
         assert!(limiter.record(true));
         assert!(!limiter.record(true));
-        assert!(!limiter.record(false));
+        assert!(limiter.record(false));
         assert!(!limiter.record(true));
         assert!(limiter.record(true));
+    }
+
+    #[test]
+    fn runtime_work_limiter_yields_when_polls_make_no_progress() {
+        let mut limiter = RuntimeWorkLimiter::new(32);
+        for _ in 0..64 {
+            assert!(limiter.record(false));
+        }
     }
 
     #[test]
@@ -10272,7 +10276,7 @@ mod tests {
         let mut limiter = RuntimeWorkLimiter::new(0);
 
         assert!(limiter.record(true));
-        assert!(!limiter.record(false));
+        assert!(limiter.record(false));
         assert!(limiter.record(true));
     }
 
@@ -13169,6 +13173,128 @@ mod tests {
             driver,
             client_buffer,
         )
+    }
+
+    #[cfg(all(
+        feature = "runtime-tokio",
+        any(feature = "rustls-ring", feature = "rustls-aws-lc-rs")
+    ))]
+    #[test]
+    fn endpoint_driver_resumes_queued_datagrams_after_work_budget_is_exhausted() {
+        let (endpoint, _peer, connection, driver, mut buffer) = established_client_driver();
+        connection.send_datagram(b"first").unwrap();
+        connection.send_datagram(b"second").unwrap();
+        let mut drivers = BTreeMap::new();
+        drivers.insert(
+            0,
+            EndpointOwnedOneRttDriver {
+                id: 0,
+                connection,
+                driver,
+            },
+        );
+
+        // The first poll can send an MTU probe before the queued datagrams.
+        // Each subsequent poll must remain ready without another application wakeup.
+        for _ in 0..8 {
+            let (progress, retained) =
+                endpoint.poll_taken_endpoint_one_rtt_drivers(drivers, &mut buffer, 1);
+            drivers = retained;
+            assert_eq!(progress.sent_packets, 1);
+            if drivers[&0].connection.diagnostics().send_datagrams_queued == 0 {
+                break;
+            }
+            assert!(endpoint.endpoint_driver_scheduler.has_ready());
+        }
+        assert_eq!(
+            drivers[&0].connection.diagnostics().send_datagrams_queued,
+            0
+        );
+        assert!(!endpoint.endpoint_driver_scheduler.has_ready());
+    }
+
+    #[cfg(all(
+        feature = "runtime-tokio",
+        any(feature = "rustls-ring", feature = "rustls-aws-lc-rs")
+    ))]
+    #[test]
+    fn endpoint_driver_waits_when_datagram_exceeds_remaining_congestion_window() {
+        let (endpoint, _peer, connection, driver, mut buffer) = established_client_driver();
+        let stats = connection.stats();
+        connection.record_test_sent_packet(
+            quion_proto::crypto::EncryptionLevel::OneRtt,
+            driver.builder.next_one_rtt_packet_number(),
+            stats.congestion_window - stats.bytes_in_flight - 100,
+            true,
+            web_time::Instant::now(),
+        );
+        connection.send_datagram(vec![0; 1_000]).unwrap();
+        assert!(connection.runtime_has_immediate_work());
+        let mut drivers = BTreeMap::new();
+        drivers.insert(
+            0,
+            EndpointOwnedOneRttDriver {
+                id: 0,
+                connection,
+                driver,
+            },
+        );
+
+        let (progress, drivers) =
+            endpoint.poll_taken_endpoint_one_rtt_drivers(drivers, &mut buffer, 32);
+
+        assert_eq!(progress.sent_packets, 0);
+        assert_eq!(
+            drivers[&0].connection.diagnostics().send_datagrams_queued,
+            1
+        );
+        assert!(!endpoint.endpoint_driver_scheduler.has_ready());
+        assert!(
+            progress
+                .next_timeout
+                .is_some_and(|at| at > web_time::Instant::now())
+        );
+    }
+
+    #[cfg(all(
+        feature = "runtime-tokio",
+        any(feature = "rustls-ring", feature = "rustls-aws-lc-rs")
+    ))]
+    #[test]
+    fn endpoint_driver_waits_for_paced_transmit_with_more_datagrams_queued() {
+        let (endpoint, peer, connection, mut driver, mut buffer) = established_client_driver();
+        connection.send_datagram(b"queued").unwrap();
+        let send_at = web_time::Instant::now() + Duration::from_secs(10);
+        driver.pending_transmits.push_back(PendingOneRttTransmit {
+            transmit: quion_udp::Transmit {
+                destination: peer.local_addr(),
+                source: None,
+                ecn: None,
+                contents: vec![0; 100],
+                segment_size: None,
+                send_at: Some(send_at),
+            },
+            contains_ack: false,
+            #[cfg(all(feature = "gso", any(target_os = "linux", test)))]
+            packet_count: 1,
+        });
+        let mut drivers = BTreeMap::new();
+        drivers.insert(
+            0,
+            EndpointOwnedOneRttDriver {
+                id: 0,
+                connection,
+                driver,
+            },
+        );
+
+        let (progress, drivers) =
+            endpoint.poll_taken_endpoint_one_rtt_drivers(drivers, &mut buffer, 32);
+
+        assert_eq!(progress.sent_packets, 0);
+        assert_eq!(progress.next_send_at, Some(send_at));
+        assert_eq!(drivers[&0].driver.pending_transmits.len(), 1);
+        assert!(!endpoint.endpoint_driver_scheduler.has_ready());
     }
 
     #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]

@@ -155,6 +155,7 @@ impl Header {
         w.into_vec()
     }
 
+    #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
     pub(crate) fn append_encoded_to(&self, output: &mut Vec<u8>) {
         let mut w = Writer::from_vec(std::mem::take(output));
         self.encode_into_writer(&mut w);
