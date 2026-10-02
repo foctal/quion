@@ -307,6 +307,75 @@ mod tests {
     }
 
     #[test]
+    fn wildcard_ipv4_source_send_over_loopback() {
+        wildcard_source_over_loopback("0.0.0.0:0", "127.0.0.1:0", false);
+    }
+
+    #[test]
+    fn wildcard_ipv4_source_batch_send_over_loopback() {
+        wildcard_source_over_loopback("0.0.0.0:0", "127.0.0.1:0", true);
+    }
+
+    #[test]
+    fn wildcard_ipv6_source_send_over_loopback() {
+        wildcard_source_over_loopback("[::]:0", "[::1]:0", false);
+    }
+
+    #[test]
+    fn wildcard_ipv6_source_batch_send_over_loopback() {
+        wildcard_source_over_loopback("[::]:0", "[::1]:0", true);
+    }
+
+    fn wildcard_source_over_loopback(bind: &str, loopback: &str, batch: bool) {
+        use std::time::{Duration, Instant};
+
+        let sender = UdpSocket::bind(bind.parse().unwrap()).unwrap();
+        let receiver = UdpSocket::bind(loopback.parse().unwrap()).unwrap();
+        let source = sender.local_addr().unwrap();
+        let destination = receiver.local_addr().unwrap();
+        assert!(source.ip().is_unspecified());
+
+        for ecn in [None, Some(EcnCodepoint::Ect0), Some(EcnCodepoint::Ect1)] {
+            let transmit = Transmit {
+                destination,
+                source: Some(source),
+                ecn,
+                contents: b"wildcard-source".to_vec(),
+                segment_size: None,
+                send_at: None,
+            };
+            if batch {
+                let mut send = BatchSend::default();
+                send.push(transmit);
+                assert_eq!(sender.send_batch(&send).unwrap(), 1);
+            } else {
+                assert_eq!(sender.send(&transmit).unwrap(), transmit.contents.len());
+            }
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut buffer = [0; 64];
+            let meta = loop {
+                if let Some(meta) = receiver.recv(&mut buffer).unwrap() {
+                    break meta;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "wildcard-source datagram timed out"
+                );
+                std::thread::yield_now();
+            };
+            assert_eq!(&buffer[..meta.len], b"wildcard-source");
+            assert_eq!(
+                meta.remote,
+                SocketAddr::new(destination.ip(), source.port())
+            );
+            if receiver.ecn_capabilities().read {
+                assert_eq!(meta.ecn, ecn);
+            }
+        }
+    }
+
+    #[test]
     fn wildcard_sender_selects_an_explicit_source_address() {
         let sender = UdpSocket::bind("0.0.0.0:0".parse().unwrap()).unwrap();
         let receiver = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
