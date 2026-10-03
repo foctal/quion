@@ -31,8 +31,8 @@ unstable-nat-traversal = ["quion-proto/unstable-nat-traversal"]
 wasm = []
 
 [dependencies]
-quion-proto = { path = "../quion-proto", version = "0.2.1", default-features = false }
-quion-udp = { path = "../quion-udp", version = "0.2.1", default-features = false }
+quion-proto = { path = "../quion-proto", version = "0.2.2", default-features = false }
+quion-udp = { path = "../quion-udp", version = "0.2.2", default-features = false }
 rand.workspace = true
 hmac.workspace = true
 sha2.workspace = true

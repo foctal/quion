@@ -4027,6 +4027,18 @@ impl RoutedDatagram {
     }
 }
 
+// Keep the atomic update API compatible with the Rust 1.88 MSRV.
+#[allow(
+    deprecated,
+    reason = "AtomicUsize::try_update is unavailable on Rust 1.88"
+)]
+fn try_update_relaxed(
+    value: &AtomicUsize,
+    update: impl FnMut(usize) -> Option<usize>,
+) -> Result<usize, usize> {
+    value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, update)
+}
+
 /// Shared retained-payload ceiling for every connection owned by an endpoint.
 #[derive(Debug)]
 pub(crate) struct EndpointMemoryBudget {
@@ -4043,12 +4055,11 @@ impl EndpointMemoryBudget {
     }
 
     pub(crate) fn try_reserve(self: &Arc<Self>, bytes: usize) -> Option<EndpointMemoryReservation> {
-        self.used_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                used.checked_add(bytes)
-                    .filter(|next| *next <= self.max_bytes)
-            })
-            .ok()?;
+        try_update_relaxed(&self.used_bytes, |used| {
+            used.checked_add(bytes)
+                .filter(|next| *next <= self.max_bytes)
+        })
+        .ok()?;
         Some(EndpointMemoryReservation {
             budget: self.clone(),
             bytes,
@@ -4057,11 +4068,7 @@ impl EndpointMemoryBudget {
     }
 
     fn release(&self, bytes: usize) {
-        let _ = self
-            .used_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                Some(used.saturating_sub(bytes))
-            });
+        let _ = try_update_relaxed(&self.used_bytes, |used| Some(used.saturating_sub(bytes)));
     }
 
     pub(crate) fn used_bytes(&self) -> usize {
@@ -4088,14 +4095,11 @@ impl EndpointMemoryReservation {
     fn resize(&mut self, new_bytes: usize) -> bool {
         if new_bytes > self.bytes {
             let additional = new_bytes - self.bytes;
-            if self
-                .budget
-                .used_bytes
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                    used.checked_add(additional)
-                        .filter(|next| *next <= self.budget.max_bytes)
-                })
-                .is_err()
+            if try_update_relaxed(&self.budget.used_bytes, |used| {
+                used.checked_add(additional)
+                    .filter(|next| *next <= self.budget.max_bytes)
+            })
+            .is_err()
             {
                 return false;
             }
@@ -4291,12 +4295,11 @@ impl RoutedDatagramMemoryBudget {
 
     fn try_reserve(self: &Arc<Self>, bytes: usize) -> Option<RoutedDatagramMemoryReservation> {
         let endpoint_reservation = self.endpoint_budget.try_reserve(bytes)?;
-        self.used_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                used.checked_add(bytes)
-                    .filter(|next| *next <= self.max_bytes)
-            })
-            .ok()?;
+        try_update_relaxed(&self.used_bytes, |used| {
+            used.checked_add(bytes)
+                .filter(|next| *next <= self.max_bytes)
+        })
+        .ok()?;
         Some(RoutedDatagramMemoryReservation {
             budget: self.clone(),
             bytes,
@@ -4318,12 +4321,9 @@ pub(crate) struct RoutedDatagramMemoryReservation {
 
 impl Drop for RoutedDatagramMemoryReservation {
     fn drop(&mut self) {
-        let _ = self
-            .budget
-            .used_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                Some(used.saturating_sub(self.bytes))
-            });
+        let _ = try_update_relaxed(&self.budget.used_bytes, |used| {
+            Some(used.saturating_sub(self.bytes))
+        });
     }
 }
 

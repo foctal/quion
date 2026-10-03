@@ -191,6 +191,7 @@ pub(crate) fn send(
     }
     if let Some(source) = transmit
         .source
+        .filter(|source| !source.ip().is_unspecified())
         .filter(|source| bound_local.ip().is_unspecified() || source.ip() != bound_local.ip())
     {
         push_source_control(&mut message, &mut control_len, source)?;

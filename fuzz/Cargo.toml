@@ -10,7 +10,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = { version = "0.4", optional = true }
-quion-proto = { path = "../quion-proto", version = "0.2.1", features = ["arbitrary", "rustls-ring"] }
+quion-proto = { path = "../quion-proto", version = "0.2.2", features = ["arbitrary", "rustls-ring"] }
 web-time.workspace = true
 rustls = { workspace = true, optional = true, features = ["ring"] }
 rcgen = { workspace = true, optional = true }
