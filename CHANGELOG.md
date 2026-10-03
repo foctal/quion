@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.2
+
+- Fix UDP sends on Windows with an unspecified source IP by omitting
+  source-address control messages and letting the kernel choose the source.
+- Add IPv4 and IPv6 loopback regression coverage for single and batch sends
+  with unspecified source addresses and ECN combinations.
+
 ## 0.2.1
 
 - Fix UDP sends to IPv4-mapped destinations on Linux dual-stack sockets by
